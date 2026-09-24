@@ -9,7 +9,7 @@ a limit option.
 
 One multithreaded index pass records, for the ENTIRE tree:
   - every file (path, size, mtime)                         -> files table
-  - every class/struct/enum/union/macro/global each header -> symbols table
+  - heuristic class/struct/enum/union/macro/global matches -> symbols table
     exposes (comment-aware parsing, forward decls included)
   - every #include line of every header                    -> includes table
 
@@ -52,6 +52,10 @@ import argparse
 import concurrent.futures
 import fnmatch
 import hashlib
+import json
+import stat
+import tempfile
+from pathlib import Path
 import os
 import re
 import sqlite3
@@ -60,6 +64,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import date
 
+VERSION = "1.1.0"
 SCHEMA_VERSION = "2"
 
 SCHEMA = """
@@ -167,22 +172,27 @@ def schema_is_current(db):
 
 
 def open_db_required(db_path):
-    """For read-only commands: never silently create an empty index, and
-    refuse outdated layouts with a clear re-index message."""
-    if not os.path.exists(db_path):
-        sys.exit(
-            "No index found at %s\n"
-            "Run the indexing pass first (this is the step that scans the "
-            "folders):\n\n"
-            "  python3 repoindex.py index %s\n" %
-            (db_path, os.path.dirname(db_path) or "."))
-    db = open_db(db_path)
-    if not schema_is_current(db):
-        sys.exit(
-            "Index at %s uses the old (fatter) layout.\n"
-            "Rebuild it once with the current script:\n\n"
-            "  python3 repoindex.py index %s\n" %
-            (db_path, os.path.dirname(db_path) or "."))
+    """Open a completed compatible snapshot without creating or mutating it."""
+    try:
+        uri = Path(db_path).absolute().as_uri() + "?mode=ro"
+        db = sqlite3.connect(uri, uri=True)
+        version = db.execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        if version != (SCHEMA_VERSION,):
+            raise ValueError("missing or unsupported schema version")
+        for view in ("vfiles", "vsymbols", "vincludes"):
+            db.execute("SELECT * FROM %s LIMIT 0" % view)
+        if not db.execute("SELECT value FROM meta WHERE key='updated'").fetchone():
+            raise ValueError("no completed scan metadata")
+    except (sqlite3.Error, ValueError) as exc:
+        if "db" in locals():
+            db.close()
+        sys.exit("Cannot read index %s: %s. Run 'repoindex.py index ROOT' "
+                 "explicitly to create/rebuild it." % (db_path, exc))
+    errors = db.execute("SELECT value FROM meta WHERE key='error_count'").fetchone()
+    if errors and int(errors[0]):
+        print("Warning: snapshot has %s scan errors; results are incomplete."
+              % errors[0], file=sys.stderr)
     return db
 
 
@@ -298,7 +308,8 @@ def scan_directory(dirpath, filenames, root, db_abs, with_symbols):
     for fn in filenames:
         full = os.path.join(dirpath, fn)
         # Skip the index itself and its SQLite journals (-journal/-wal/-shm)
-        if check_db and full.startswith(db_abs):
+        if check_db and full in {db_abs, db_abs + "-journal",
+                                 db_abs + "-wal", db_abs + "-shm"}:
             continue
         try:
             st = os.lstat(full)
@@ -307,7 +318,7 @@ def scan_directory(dirpath, filenames, root, db_abs, with_symbols):
             continue
         ext = os.path.splitext(fn)[1].lower()
         file_rows.append((fn, ext, st.st_size, int(st.st_mtime)))
-        if with_symbols and ext in HEADER_EXTS:
+        if with_symbols and ext in HEADER_EXTS and stat.S_ISREG(st.st_mode):
             try:
                 with open(full, "r", encoding="utf-8",
                           errors="replace") as f:
@@ -470,18 +481,20 @@ def cmd_index(args):
                     for f in done:
                         rel = pending.pop(f)
                         try:
-                            consume(rel, f.result())
+                            result = f.result()
                         except Exception as e:
                             errors += 1
-                            print("  warning: worker failed: %s" % e,
-                                  file=sys.stderr)
+                            print("  warning: worker failed: %s" % e, file=sys.stderr)
+                        else:
+                            consume(rel, result)
             for f in concurrent.futures.as_completed(pending):
                 try:
-                    consume(pending[f], f.result())
+                    result = f.result()
                 except Exception as e:
                     errors += 1
-                    print("  warning: worker failed: %s" % e,
-                          file=sys.stderr)
+                    print("  warning: worker failed: %s" % e, file=sys.stderr)
+                else:
+                    consume(pending[f], result)
     flush()
 
     cur.execute("INSERT OR REPLACE INTO meta VALUES ('root', ?)", (root,))
@@ -495,6 +508,12 @@ def cmd_index(args):
                 (str(n_symbols),))
     cur.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)",
                 (SCHEMA_VERSION,))
+    cur.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)", [
+        ("error_count", str(errors)),
+        ("ignore_directories", json.dumps(sorted(ignores))),
+        ("symbols_enabled", str(with_symbols).lower()),
+        ("symlink_policy", "record file links; do not parse or traverse links"),
+    ])
     db.commit()
 
     t1 = time.time()
@@ -513,7 +532,7 @@ def cmd_index(args):
     print("Index size: %s -> %s" %
           (human_size(os.path.getsize(db_path)), db_path))
     if errors:
-        print("Warning: %d paths unreadable (permissions)" % errors)
+        print("Warning: %d scan errors; snapshot is incomplete" % errors)
 
 
 # ---------------------------------------------------------------------------
@@ -1142,7 +1161,7 @@ def cmd_headers(args):
             for fn in filenames:
                 if any(fnmatch.fnmatch(fn, p) for p in patterns):
                     full = os.path.join(dirpath, fn)
-                    if os.path.isfile(full):
+                    if not os.path.islink(full) and os.path.isfile(full):
                         matched.append((full, fn))
     matched.sort(key=lambda t: (t[1].lower(), t[0].lower()))
 
@@ -1231,8 +1250,7 @@ def case_table_lines(db_path):
     L = []
     L.append("## Which tool for which case")
     L.append("")
-    L.append("All commands below read the index (`%s`) - instant, no "
-             "rescanning. `python3 repoindex.py <cmd> -h` lists every flag."
+    L.append("Indexed queries read the snapshot (`%s`). `headers` scans source; `dupes` reads candidate files. `python3 repoindex.py <cmd> -h` lists every flag."
              % db_path)
     L.append("")
     L.append("| Situation | Command |")
@@ -1285,6 +1303,85 @@ def token_rules_lines():
     return L
 
 
+GUIDE_BEGIN = "<!-- repoindex:begin -->"
+GUIDE_END = "<!-- repoindex:end -->"
+
+
+def snapshot_note(meta):
+    return ("Index coverage: snapshot %s; symbols=%s; scan errors=%s; "
+            "excluded directory names=%s. This is not a live tree check. "
+            "Header parsing is heuristic, not a compiler-complete symbol inventory.\n\n" %
+            (meta.get("updated", "unknown"), meta.get("symbols_enabled", "unknown"),
+             meta.get("error_count", "unknown"), meta.get("ignore_directories", "unknown")))
+
+
+def merge_guide(existing, text, replace=False):
+    """Replace only our delimited block; protect hand-written instructions."""
+    block = GUIDE_BEGIN + "\n" + text.rstrip() + "\n" + GUIDE_END + "\n"
+    if replace or not existing:
+        return block
+    if existing.count(GUIDE_BEGIN) == 1 and existing.count(GUIDE_END) == 1:
+        start = existing.index(GUIDE_BEGIN)
+        end = existing.index(GUIDE_END)
+        if end < start:
+            raise ValueError("reversed repoindex markers")
+        return existing[:start] + block.rstrip("\n") + existing[end + len(GUIDE_END):]
+    raise ValueError("existing file has no unique repoindex block; use a new "
+                     "output path or --replace only after preserving curated text")
+
+
+def emit_guide(args, text):
+    if not args.out:
+        sys.stdout.write(text)
+        return
+    destinations = [os.path.abspath(args.out)]
+    for alias in (getattr(args, "also", None) or "").split(","):
+        if alias.strip():
+            destinations.append(os.path.abspath(os.path.join(
+                os.path.dirname(destinations[0]), alias.strip())))
+    prepared = []
+    # Preflight every alias before changing any file.
+    for dest in dict.fromkeys(destinations):
+        if os.path.islink(dest):
+            sys.exit("Refusing symlink output: %s" % dest)
+        existing = Path(dest).read_text(encoding="utf-8") if os.path.exists(dest) else ""
+        try:
+            merged = merge_guide(existing, text, getattr(args, "replace", False))
+        except ValueError as exc:
+            sys.exit("Cannot write %s: %s" % (dest, exc))
+        prepared.append((dest, merged))
+    for dest, merged in prepared:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".repoindex-guide-", dir=os.path.dirname(dest))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(merged)
+            if os.path.exists(dest):
+                os.chmod(tmp, stat.S_IMODE(os.stat(dest).st_mode))
+            os.replace(tmp, dest)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        print("Wrote %s (%s)" % (dest, human_size(len(merged))))
+
+
+def cmd_status(args):
+    db = open_db_required(resolve_db(args))
+    meta = dict(db.execute("SELECT key,value FROM meta"))
+    db.close()
+    report = {"metadata": meta, "live_tree_verified": False,
+              "coverage_known": all(k in meta for k in
+                  ("error_count", "ignore_directories", "symbols_enabled"))}
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print("Stored snapshot (not a live freshness check):")
+        for key, value in sorted(meta.items()):
+            print("  %s: %s" % (key, value))
+        if not report["coverage_known"]:
+            print("Coverage metadata unavailable in this older index; rebuild explicitly if needed.")
+
+
 def compact_agentsmd(root, title, db_path, total_files, total_bytes,
                      n_symbols, n_sym_headers):
     """Minimal agent guide for context-limited hosts (LM Studio and other
@@ -1292,17 +1389,15 @@ def compact_agentsmd(root, title, db_path, total_files, total_bytes,
     L = []
     L.append("# %s (compact)" % title)
     L.append("")
-    L.append("Compact variant for context-limited agents (local models). The "
-             "full AGENTS.md carries the directory map, file census and "
-             "header inventory; this file keeps only what an agent needs to "
-             "*find* things.")
+    L.append("Navigation guide for agents. Generate a separate report with --full "
+             "only when the complete directory map and census are needed; "
+             "this guide keeps only what an agent needs to *find* things.")
     L.append("")
     L.append("## The index")
     L.append("")
     L.append("`%s`: %d files (%s), %d exposed header symbols from %d "
-             "headers, plus the full include graph. SQLite; query via views "
-             "`vfiles` / `vsymbols` / `vincludes`. All commands below are "
-             "instant reads of this index - never rescan the tree."
+             "headers, plus extracted header includes. SQLite; query via views "
+             "`vfiles` / `vsymbols` / `vincludes`. Indexed queries below read a snapshot; headers and dupes also access source files."
              % (db_path, total_files, human_size(total_bytes), n_symbols,
                 n_sym_headers))
     L.append("")
@@ -1320,12 +1415,28 @@ def compact_agentsmd(root, title, db_path, total_files, total_bytes,
 def cmd_agentsmd(args):
     root = os.path.abspath(args.root)
     db_path = resolve_db(args, root)
-    if args.reindex or not os.path.exists(db_path):
+    if args.reindex:
         print("Building index first -> %s" % db_path)
         cmd_index(argparse.Namespace(
             root=root, db=db_path, no_ignore=False,
             ignore=args.ignore, no_symbols=False, jobs=0))
     db = open_db_required(db_path)
+    meta = dict(db.execute("SELECT key, value FROM meta"))
+    if os.path.realpath(meta.get("root", "")) != os.path.realpath(root):
+        db.close()
+        sys.exit("Index root does not match requested root; select the correct "
+                 "--db or explicitly --reindex.")
+    name = os.path.basename(root.rstrip(os.sep)) or root
+    title = args.title or "%s - agent guide" % name
+    if getattr(args, "compact", False):
+        totals = db.execute("SELECT COUNT(*), COALESCE(SUM(size),0) FROM files").fetchone()
+        ns = db.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
+        nh = db.execute("SELECT COUNT(*) FROM (SELECT dir_id,file FROM symbols "
+                        "GROUP BY dir_id,file)").fetchone()[0]
+        text = compact_agentsmd(root, title, db_path, *totals, ns, nh)
+        db.close()
+        emit_guide(args, snapshot_note(meta) + text)
+        return
     rows = db.execute("SELECT path, size FROM vfiles").fetchall()
     ext_rows = db.execute(
         "SELECT ext, COUNT(*), SUM(size) FROM vfiles GROUP BY ext "
@@ -1340,13 +1451,13 @@ def cmd_agentsmd(args):
 
     name = os.path.basename(root.rstrip(os.sep)) or root
     title = args.title or "%s - agent guide" % name
-    today = date.today().isoformat()
+    today = meta.get("updated", "unknown")
     depth = args.depth
 
     L = []
     L.append("# %s" % title)
     L.append("")
-    L.append("Updated: %s. Structural sections (trees, census, header/symbol "
+    L.append("Index snapshot: %s. Structural sections (trees, census, header/symbol "
              "map) are generated in full from the file index - no sampling, "
              "no cutouts." % today)
     L.append("")
@@ -1497,9 +1608,9 @@ def cmd_agentsmd(args):
     L.append("## Verified observations and open leads")
     L.append("")
     L.append("<!-- TODO(curate): hand-maintained findings. Generated sections "
-             "above are rebuilt from the index; anything written below this "
-             "line is preserved only if you merge manually when "
-             "regenerating. -->")
+             "above are rebuilt from the index. Put curated instructions "
+             "outside the repoindex:begin/end markers so regeneration "
+             "preserves them. -->")
     L.append("")
 
     if getattr(args, "compact", False):
@@ -1507,23 +1618,8 @@ def cmd_agentsmd(args):
                                 total_bytes, n_symbols, n_sym_headers)
     else:
         text = "\n".join(L).rstrip() + "\n"
-    if args.out:
-        with open(args.out, "w", encoding="utf-8") as f:
-            f.write(text)
-        print("Wrote %s (%s)" % (args.out, human_size(len(text))))
-        aliases = [a.strip() for a in (getattr(args, "also", None) or "")
-                   .split(",") if a.strip()]
-        for alias in aliases:
-            dest = alias if os.path.isabs(alias) else os.path.join(
-                os.path.dirname(os.path.abspath(args.out)), alias)
-            parent = os.path.dirname(dest)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(dest, "w", encoding="utf-8") as f:
-                f.write(text)
-            print("Wrote %s (platform alias, same content)" % dest)
-    else:
-        sys.stdout.write(text)
+    db.close()
+    emit_guide(args, snapshot_note(meta) + text)
 
 
 # ---------------------------------------------------------------------------
@@ -1611,7 +1707,10 @@ def cmd_dupes(args):
         for p in paths:
             try:
                 h = hashlib.sha1()
-                with open(os.path.join(root, p), "rb") as f:
+                candidate = os.path.join(root, p)
+                if not stat.S_ISREG(os.lstat(candidate).st_mode):
+                    continue
+                with open(candidate, "rb") as f:
                     for chunk in iter(lambda: f.read(1 << 20), b""):
                         h.update(chunk)
                 hashes[h.hexdigest()].append(p)
@@ -1632,6 +1731,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="Full-coverage file + symbol indexing for huge source "
                     "trees.")
+    ap.add_argument("--version", action="version", version="repoindex " + VERSION)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("index", help="Index a tree into SQLite (multithreaded)")
@@ -1727,24 +1827,34 @@ def main():
     p.add_argument("--title", help="Document title")
     p.add_argument("--depth", type=int, default=2,
                    help="Directory map depth (default: 2)")
+    p.add_argument("--replace", action="store_true",
+                   help="Explicitly replace an unmarked guide; default preserves curated text")
     p.add_argument("--reindex", action="store_true",
                    help="Rebuild the index before generating")
     p.add_argument("--ignore", action="append",
-                   help="Extra directory name to skip when auto-indexing")
+                   help="Extra directory name to skip with --reindex")
     p.add_argument("--key-files", action="store_true",
                    help="Also include a Key files section (build/config "
                         "files: *.mk, Android.bp, Makefiles, ...). Off by "
                         "default - those matter for building the tree, not "
                         "for searching reference code.")
-    p.add_argument("--compact", action="store_true",
-                   help="Write a minimal guide for context-limited agent "
-                        "hosts (LM Studio, small local models): index "
-                        "facts, which-tool table and token rules only")
+    guide_mode = p.add_mutually_exclusive_group()
+    guide_mode.add_argument("--compact", dest="compact", action="store_true",
+                            help="Minimal navigation guide (default)")
+    guide_mode.add_argument("--full", dest="compact", action="store_false",
+                            help="Explicitly include the full structural inventory")
+    p.set_defaults(compact=True)
     p.add_argument("--also",
                    help="Comma-separated extra filenames to write the same "
                         "guide to, next to --out (e.g. CLAUDE.md,GEMINI.md,"
                         ".github/copilot-instructions.md)")
     p.set_defaults(fn=cmd_agentsmd)
+
+    p = sub.add_parser("status", help="Stored snapshot provenance and coverage (no scan)")
+    p.add_argument("--db")
+    p.add_argument("--root", default=".")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_status)
 
     p = sub.add_parser("stats", help="Index statistics")
     p.add_argument("--db")
@@ -1774,6 +1884,10 @@ def main():
     p.set_defaults(fn=cmd_dupes)
 
     args = ap.parse_args()
+    if args.cmd == "agentsmd" and args.also and not args.out:
+        ap.error("--also requires --out")
+    if args.cmd == "agentsmd" and args.key_files and args.compact:
+        ap.error("--key-files requires --full")
     args.fn(args)
 
 

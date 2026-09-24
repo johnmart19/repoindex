@@ -4,8 +4,8 @@ Full-coverage file + symbol indexing for huge source trees, built for
 AI-agent workflows on WSL. Designed for multi-million-file Android/AOSP-sized
 repositories (Android/AOSP-scale trees, vendor source drops, SDK mirrors).
 
-One multithreaded pass scans an entire tree and records **every file**, the
-**every class/struct/enum/union/macro/global variable each header exposes**,
+One multithreaded pass scans an entire tree and records **every non-excluded file**, plus
+**heuristically extracted class/struct/enum/union/macro/global declarations**,
 and the **complete `#include` graph** — into a compact SQLite database with
 no sampling and no cutouts. All reports are generated from that index in
 seconds.
@@ -36,6 +36,28 @@ Measured on real trees: ~89% of header symbols are `#define` macros, only
 ~18% of rows are cross-header duplicates. The tool's output formats are
 built around that reality.
 
+## Safe agent workflow (1.1)
+
+```bash
+python3 repoindex.py --version
+python3 repoindex.py index ~/references_code --ignore out
+python3 repoindex.py status --root ~/references_code --json
+python3 repoindex.py agentsmd ~/references_code --out ~/references_code/INDEX_GUIDE.md
+# Only when needed, keep a full inventory outside the auto-loaded agent prompt:
+python3 repoindex.py agentsmd ~/references_code --full --out ~/references_code/STRUCTURE.md
+```
+
+- Guide generation **never starts a scan implicitly**. Use `index` or explicit `agentsmd --reindex`.
+- Compact output is now the default and avoids loading the entire file inventory into Python. `--full` retains the previous detailed report.
+- Generated files contain `<!-- repoindex:begin -->` / `<!-- repoindex:end -->`. Regeneration replaces only that block and preserves text outside it. Existing unmarked files are refused; use a new output file, or explicitly `--replace` after saving curated content. All aliases are checked before writing; each output is replaced atomically. A later I/O failure can still leave a partially completed multi-file export.
+- Query connections use SQLite read-only mode and reject missing/incompatible/incomplete metadata instead of creating or repairing databases. Existing schema-2 indexes remain readable; absent new coverage fields are reported as unknown, not zero errors.
+- `status` reports the stored root, scan date, exclusions, symbol mode and error count. It does **not** scan or prove freshness. Guide dates identify the index snapshot rather than today's report-generation date.
+- Header extraction is heuristic, not a complete C++ parser. Directory symlinks are not traversed; file symlinks/special files are recorded as file entries but not opened for header parsing. The index and exact SQLite journals are excluded, not unrelated files sharing the database filename prefix.
+- Fixes do not implement incremental indexing or guarantee an interrupted rebuild preserves the previous snapshot. Keep a backup if an index is costly to regenerate.
+- A copied SQLite snapshot can support indexed queries via `--db` without the original source tree. `headers`, duplicate hashing, live verification and reindexing still require source access. A guide is navigation, not evidence of successful builds or runtime validation.
+
+Run the fixture regression suite with `python3 -m unittest discover -s tests -v`. It does not scan Android sources or build a ROM.
+
 ## Requirements
 
 - Python 3.8+ (WSL Ubuntu/Debian default is fine). No pip installs.
@@ -57,7 +79,7 @@ chmod +x ~/repoindex.py   # optional; always run via python3
 #    This is the only step that scans folders; expect minutes on huge trees.
 python3 ~/repoindex.py index ~/references_code --ignore out --ignore prebuilts
 
-# 2. Everything else is instant — reads the index at
+# 2. Query commands read the stored snapshot at
 #    ~/references_code/.repoindex.db:
 
 # which header exposes a class seen in a log?
@@ -204,24 +226,26 @@ python3 repoindex.py headers ~/references_code \
 ```bash
 python3 repoindex.py agentsmd ROOT [--out FILE] [--title T]
                         [--depth N] [--reindex] [--ignore NAME]...
-                        [--key-files] [--compact] [--also NAMES]
+                        [--key-files] [--compact | --full] [--also NAMES] [--replace]
 ```
 
-Generates from the index (auto-indexes if missing): full directory map with
+Reads an existing index; a missing index fails without scanning. `--reindex` explicitly scans first.
+The default is a compact navigation guide. `--full` produces a directory map with
 recursive counts/sizes to `--depth` (default 2), complete file-type census,
 header/symbol counts per top-level component, a **Which tool for which
 case** decision table mapping situations to commands, ready-to-run search
 recipes, SQL examples, and a **Token-efficient usage** section teaching
-agents to grep/query instead of loading dumps. Human-knowledge sections (workspace
-roles, verified observations) are marked with `<!-- TODO(curate) -->` slots.
+agents to grep/query instead of loading dumps. Generated TODO prompts suggest workspace roles and verified observations. Put
+actual curated instructions **outside** the generated markers; text inside them
+is regenerated.
 
-`--key-files` additionally appends a Key files section (every `*.mk`,
+`--key-files` requires `--full` and additionally appends a Key files section (every `*.mk`,
 `Android.bp`, `Makefile`, build config, ...). It is **off by default**:
 build files matter to people who want to *build* the tree, while the
 reference-search workflow targets variables, locations and definitions that
 get matched against logs.
 
-`--compact` writes a minimal variant for context-limited hosts (LM Studio
+The default (`--compact`) writes a minimal variant for context-limited hosts (LM Studio
 and other local models): index facts, the which-tool table and the token
 rules only. `--also CLAUDE.md,GEMINI.md` writes the same guide to extra
 filenames so platforms with their own instruction-file conventions pick it
@@ -361,8 +385,8 @@ local variables, anonymous enums/unions, and anything inside comments.
 |---|---|
 | `Wrote ... (0 symbols)` | `symbols`/`lookup` read the index; they don't scan. Run `index` first (see its final `Recorded N exposed symbols` line — N should be large). |
 | `No index found at ...` | Same as above; read commands refuse to silently create an empty DB. |
-| `old (fatter) layout` | Index was built by an earlier repoindex.py. Re-run `index` once with the current script — it rebuilds compact. |
-| `Warning: N paths unreadable` | Permission-denied files were skipped; everything else was indexed. |
+| `Cannot read index` | Index was built by an earlier repoindex.py. Re-run `index` once with the current script — it rebuilds compact. |
+| `Warning: N scan errors` | Snapshot is incomplete. Inspect access/worker failures; use `status` to inspect stored coverage. |
 | Scan feels slow | Check the tree isn't under `/mnt/c`; add `--ignore out`/`--jobs`; first cold run is disk-bound by nature. |
 | Out of disk during build | `VACUUM` temporarily needs ~1× the DB size of free space. |
 
