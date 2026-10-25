@@ -41,6 +41,24 @@ class RepoindexTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             r.cmd_agentsmd(argparse.Namespace(**opts))
 
+    def test_legacy_search_closes_connection_on_success_and_output_failure(self):
+        self.index()
+        args = argparse.Namespace(db=str(self.db), root=str(self.root),
+            pattern="*.h", ext=None, limit=1, path_prefix=None,
+            json=False, paths_only=True)
+        real_open = r.open_db_required
+        for fail in (False, True):
+            connection = real_open(str(self.db))
+            with mock.patch.object(r, "open_db_required", return_value=connection), contextlib.redirect_stderr(io.StringIO()):
+                if fail:
+                    with mock.patch("builtins.print", side_effect=BrokenPipeError), self.assertRaises(BrokenPipeError):
+                        r.cmd_search(args)
+                else:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        r.cmd_search(args)
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute("SELECT 1")
+
     def test_scoped_search_streams_json_without_sibling_leak(self):
         for folder in ("vendor/cam", "vendor/camera", "vendor/ca_m%"):
             (self.root / folder).mkdir(parents=True)
@@ -73,7 +91,7 @@ class RepoindexTests(unittest.TestCase):
         self.assertFalse(self.db.exists())
 
     def test_invalid_database_is_not_modified(self):
-        with sqlite3.connect(self.db) as db:
+        with contextlib.closing(sqlite3.connect(self.db)) as db, db:
             db.execute("CREATE TABLE unrelated(value)")
         before = self.db.read_bytes()
         with self.assertRaises(SystemExit):
@@ -179,7 +197,7 @@ class RepoindexTests(unittest.TestCase):
     def test_parallel_and_serial_have_same_records(self):
         self.index()
         def read():
-            with sqlite3.connect(self.db) as db:
+            with contextlib.closing(sqlite3.connect(self.db)) as db, db:
                 return [db.execute("SELECT * FROM " + v + " ORDER BY 1,2").fetchall()
                         for v in ("vfiles", "vsymbols", "vincludes")]
         first = read()
@@ -201,7 +219,7 @@ class RepoindexTests(unittest.TestCase):
 
     def test_old_schema2_coverage_remains_unknown(self):
         self.index()
-        with sqlite3.connect(self.db) as db:
+        with contextlib.closing(sqlite3.connect(self.db)) as db, db:
             db.execute("DELETE FROM meta WHERE key IN ('error_count','ignore_directories','symbols_enabled')")
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -224,7 +242,7 @@ class RepoindexTests(unittest.TestCase):
 
     def test_guide_uses_snapshot_date_not_generation_date(self):
         self.index()
-        with sqlite3.connect(self.db) as db:
+        with contextlib.closing(sqlite3.connect(self.db)) as db, db:
             db.execute("UPDATE meta SET value='2000-01-01' WHERE key='updated'")
         self.guide(compact=False)
         self.assertIn("Index snapshot: 2000-01-01", (self.root / "AGENTS.md").read_text())

@@ -50,6 +50,7 @@ indexing over the 9P mount is an order of magnitude slower.
 
 import argparse
 import concurrent.futures
+from contextlib import closing
 import fnmatch
 import hashlib
 import json
@@ -343,196 +344,195 @@ def cmd_index(args):
     with_symbols = not getattr(args, "no_symbols", False)
     jobs = max(1, getattr(args, "jobs", 0) or default_jobs())
     db_path = resolve_db(args, root)
-    db = open_db(db_path)
-    if not schema_is_current(db):
-        # Old (fatter) layout: drop it entirely and rebuild compact.
-        db.executescript("""
-            DROP VIEW IF EXISTS vfiles;
-            DROP VIEW IF EXISTS vsymbols;
-            DROP VIEW IF EXISTS vincludes;
-            DROP TABLE IF EXISTS files;
-            DROP TABLE IF EXISTS symbols;
-            DROP TABLE IF EXISTS includes;
-            DROP TABLE IF EXISTS dirs;
-            DROP TABLE IF EXISTS inc_targets;
-            DROP TABLE IF EXISTS meta;
-        """)
-        db.executescript(SCHEMA)
-        print("Old index layout dropped; rebuilding compact.")
-    db.execute("PRAGMA journal_mode=WAL")
-    db.execute("PRAGMA synchronous=OFF")
-    db_abs = os.path.abspath(db_path)
+    with closing(open_db(db_path)) as db:
+        if not schema_is_current(db):
+            # Old (fatter) layout: drop it entirely and rebuild compact.
+            db.executescript("""
+                DROP VIEW IF EXISTS vfiles;
+                DROP VIEW IF EXISTS vsymbols;
+                DROP VIEW IF EXISTS vincludes;
+                DROP TABLE IF EXISTS files;
+                DROP TABLE IF EXISTS symbols;
+                DROP TABLE IF EXISTS includes;
+                DROP TABLE IF EXISTS dirs;
+                DROP TABLE IF EXISTS inc_targets;
+                DROP TABLE IF EXISTS meta;
+            """)
+            db.executescript(SCHEMA)
+            print("Old index layout dropped; rebuilding compact.")
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=OFF")
+        db_abs = os.path.abspath(db_path)
 
-    t0 = time.time()
-    count = 0
-    total_bytes = 0
-    n_symbols = 0
-    n_includes = 0
-    errors = 0
+        t0 = time.time()
+        count = 0
+        total_bytes = 0
+        n_symbols = 0
+        n_includes = 0
+        errors = 0
 
-    cur = db.cursor()
-    cur.execute("BEGIN")
-    for t in ("files", "symbols", "includes", "dirs", "inc_targets"):
-        cur.execute("DELETE FROM %s" % t)
-    file_batch, sym_batch, inc_batch = [], [], []
+        cur = db.cursor()
+        cur.execute("BEGIN")
+        for t in ("files", "symbols", "includes", "dirs", "inc_targets"):
+            cur.execute("DELETE FROM %s" % t)
+        file_batch, sym_batch, inc_batch = [], [], []
 
-    dir_ids = {}       # rel dir path ('' = root) -> id
-    dir_new = []       # pending (id, path) rows
-    target_ids = {}    # (target, system) -> id
-    target_new = []    # pending (id, target, system) rows
-    seq = [0, 0]       # [dir_seq, target_seq]
+        dir_ids = {}       # rel dir path ('' = root) -> id
+        dir_new = []       # pending (id, path) rows
+        target_ids = {}    # (target, system) -> id
+        target_new = []    # pending (id, target, system) rows
+        seq = [0, 0]       # [dir_seq, target_seq]
 
-    def dir_id_for(rel):
-        did = dir_ids.get(rel)
-        if did is not None:
+        def dir_id_for(rel):
+            did = dir_ids.get(rel)
+            if did is not None:
+                return did
+            seq[0] += 1
+            did = seq[0]
+            dir_ids[rel] = did
+            dir_new.append((did, rel))
             return did
-        seq[0] += 1
-        did = seq[0]
-        dir_ids[rel] = did
-        dir_new.append((did, rel))
-        return did
 
-    def target_id_for(target, system):
-        key = (target, system)
-        tid = target_ids.get(key)
-        if tid is not None:
+        def target_id_for(target, system):
+            key = (target, system)
+            tid = target_ids.get(key)
+            if tid is not None:
+                return tid
+            seq[1] += 1
+            tid = seq[1]
+            target_ids[key] = tid
+            target_new.append((tid, target, system))
             return tid
-        seq[1] += 1
-        tid = seq[1]
-        target_ids[key] = tid
-        target_new.append((tid, target, system))
-        return tid
 
-    def flush():
-        if dir_new:
-            cur.executemany("INSERT INTO dirs VALUES (?,?)", dir_new)
-            dir_new.clear()
-        if target_new:
-            cur.executemany("INSERT INTO inc_targets VALUES (?,?,?)",
-                            target_new)
-            target_new.clear()
-        if file_batch:
-            cur.executemany(
-                "INSERT OR REPLACE INTO files VALUES (?,?,?,?,?)", file_batch)
-            file_batch.clear()
-        if sym_batch:
-            cur.executemany("INSERT INTO symbols VALUES (?,?,?,?,?)",
-                            sym_batch)
-            sym_batch.clear()
-        if inc_batch:
-            cur.executemany("INSERT INTO includes VALUES (?,?,?)", inc_batch)
-            inc_batch.clear()
+        def flush():
+            if dir_new:
+                cur.executemany("INSERT INTO dirs VALUES (?,?)", dir_new)
+                dir_new.clear()
+            if target_new:
+                cur.executemany("INSERT INTO inc_targets VALUES (?,?,?)",
+                                target_new)
+                target_new.clear()
+            if file_batch:
+                cur.executemany(
+                    "INSERT OR REPLACE INTO files VALUES (?,?,?,?,?)", file_batch)
+                file_batch.clear()
+            if sym_batch:
+                cur.executemany("INSERT INTO symbols VALUES (?,?,?,?,?)",
+                                sym_batch)
+                sym_batch.clear()
+            if inc_batch:
+                cur.executemany("INSERT INTO includes VALUES (?,?,?)", inc_batch)
+                inc_batch.clear()
 
-    def onerror(err):
-        nonlocal errors
-        errors += 1
+        def onerror(err):
+            nonlocal errors
+            errors += 1
 
-    last_report = [0]
+        last_report = [0]
 
-    def consume(dir_rel, result):
-        nonlocal count, total_bytes, n_symbols, n_includes, errors
-        file_rows, sym_rows, inc_rows, errs = result
-        errors += errs
-        did = dir_id_for(dir_rel)
-        for fn, ext, size, mt in file_rows:
-            file_batch.append((did, fn, ext, size, mt))
-        count += len(file_rows)
-        total_bytes += sum(r[2] for r in file_rows)
-        for name, kind, decl, fn in sym_rows:
-            sym_batch.append((name, kind, decl, did, fn))
-        for fn, target, system in inc_rows:
-            inc_batch.append((did, fn, target_id_for(target, system)))
-        n_symbols += len(sym_rows)
-        n_includes += len(inc_rows)
-        if len(file_batch) >= 10000:
-            flush()
-        if count - last_report[0] >= 100000:
-            last_report[0] = count
-            print("  ... %d files" % count, flush=True)
+        def consume(dir_rel, result):
+            nonlocal count, total_bytes, n_symbols, n_includes, errors
+            file_rows, sym_rows, inc_rows, errs = result
+            errors += errs
+            did = dir_id_for(dir_rel)
+            for fn, ext, size, mt in file_rows:
+                file_batch.append((did, fn, ext, size, mt))
+            count += len(file_rows)
+            total_bytes += sum(r[2] for r in file_rows)
+            for name, kind, decl, fn in sym_rows:
+                sym_batch.append((name, kind, decl, did, fn))
+            for fn, target, system in inc_rows:
+                inc_batch.append((did, fn, target_id_for(target, system)))
+            n_symbols += len(sym_rows)
+            n_includes += len(inc_rows)
+            if len(file_batch) >= 10000:
+                flush()
+            if count - last_report[0] >= 100000:
+                last_report[0] = count
+                print("  ... %d files" % count, flush=True)
 
-    def prune(dirpath, dirnames):
-        dirnames[:] = [
-            d for d in dirnames
-            if d not in ignores
-            and not os.path.islink(os.path.join(dirpath, d))
-        ]
+        def prune(dirpath, dirnames):
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in ignores
+                and not os.path.islink(os.path.join(dirpath, d))
+            ]
 
-    print("Scanning with %d thread(s) ..." % jobs)
-    if jobs == 1:
-        for dirpath, dirnames, filenames in os.walk(root, onerror=onerror):
-            prune(dirpath, dirnames)
-            rel = "" if dirpath == root else posix_rel(dirpath, root)
-            consume(rel, scan_directory(dirpath, filenames, root, db_abs,
-                                        with_symbols))
-    else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
-            pending = {}   # future -> rel dir
+        print("Scanning with %d thread(s) ..." % jobs)
+        if jobs == 1:
             for dirpath, dirnames, filenames in os.walk(root, onerror=onerror):
                 prune(dirpath, dirnames)
                 rel = "" if dirpath == root else posix_rel(dirpath, root)
-                fut = ex.submit(scan_directory, dirpath, filenames, root,
-                                db_abs, with_symbols)
-                pending[fut] = rel
-                # Bounded pending queue keeps memory flat on huge trees.
-                if len(pending) >= jobs * 8:
-                    done, _pending = concurrent.futures.wait(
-                        pending,
-                        return_when=concurrent.futures.FIRST_COMPLETED)
-                    for f in done:
-                        rel = pending.pop(f)
-                        try:
-                            result = f.result()
-                        except Exception as e:
-                            errors += 1
-                            print("  warning: worker failed: %s" % e, file=sys.stderr)
-                        else:
-                            consume(rel, result)
-            for f in concurrent.futures.as_completed(pending):
-                try:
-                    result = f.result()
-                except Exception as e:
-                    errors += 1
-                    print("  warning: worker failed: %s" % e, file=sys.stderr)
-                else:
-                    consume(pending[f], result)
-    flush()
+                consume(rel, scan_directory(dirpath, filenames, root, db_abs,
+                                            with_symbols))
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
+                pending = {}   # future -> rel dir
+                for dirpath, dirnames, filenames in os.walk(root, onerror=onerror):
+                    prune(dirpath, dirnames)
+                    rel = "" if dirpath == root else posix_rel(dirpath, root)
+                    fut = ex.submit(scan_directory, dirpath, filenames, root,
+                                    db_abs, with_symbols)
+                    pending[fut] = rel
+                    # Bounded pending queue keeps memory flat on huge trees.
+                    if len(pending) >= jobs * 8:
+                        done, _pending = concurrent.futures.wait(
+                            pending,
+                            return_when=concurrent.futures.FIRST_COMPLETED)
+                        for f in done:
+                            rel = pending.pop(f)
+                            try:
+                                result = f.result()
+                            except Exception as e:
+                                errors += 1
+                                print("  warning: worker failed: %s" % e, file=sys.stderr)
+                            else:
+                                consume(rel, result)
+                for f in concurrent.futures.as_completed(pending):
+                    try:
+                        result = f.result()
+                    except Exception as e:
+                        errors += 1
+                        print("  warning: worker failed: %s" % e, file=sys.stderr)
+                    else:
+                        consume(pending[f], result)
+        flush()
 
-    cur.execute("INSERT OR REPLACE INTO meta VALUES ('root', ?)", (root,))
-    cur.execute("INSERT OR REPLACE INTO meta VALUES ('updated', ?)",
-                (datetime_iso(),))
-    cur.execute("INSERT OR REPLACE INTO meta VALUES ('file_count', ?)",
-                (str(count),))
-    cur.execute("INSERT OR REPLACE INTO meta VALUES ('total_bytes', ?)",
-                (str(total_bytes),))
-    cur.execute("INSERT OR REPLACE INTO meta VALUES ('symbol_count', ?)",
-                (str(n_symbols),))
-    cur.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)",
-                (SCHEMA_VERSION,))
-    cur.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)", [
-        ("error_count", str(errors)),
-        ("ignore_directories", json.dumps(sorted(ignores))),
-        ("symbols_enabled", str(with_symbols).lower()),
-        ("symlink_policy", "record file links; do not parse or traverse links"),
-    ])
-    db.commit()
+        cur.execute("INSERT OR REPLACE INTO meta VALUES ('root', ?)", (root,))
+        cur.execute("INSERT OR REPLACE INTO meta VALUES ('updated', ?)",
+                    (datetime_iso(),))
+        cur.execute("INSERT OR REPLACE INTO meta VALUES ('file_count', ?)",
+                    (str(count),))
+        cur.execute("INSERT OR REPLACE INTO meta VALUES ('total_bytes', ?)",
+                    (str(total_bytes),))
+        cur.execute("INSERT OR REPLACE INTO meta VALUES ('symbol_count', ?)",
+                    (str(n_symbols),))
+        cur.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)",
+                    (SCHEMA_VERSION,))
+        cur.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)", [
+            ("error_count", str(errors)),
+            ("ignore_directories", json.dumps(sorted(ignores))),
+            ("symbols_enabled", str(with_symbols).lower()),
+            ("symlink_policy", "record file links; do not parse or traverse links"),
+        ])
+        db.commit()
 
-    t1 = time.time()
-    print("Compacting (VACUUM) ...", flush=True)
-    db.execute("VACUUM")
-    db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    db.close()
+        t1 = time.time()
+        print("Compacting (VACUUM) ...", flush=True)
+        db.execute("VACUUM")
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
-    dt = time.time() - t0
-    rate = int(count / dt) if dt > 0 else count
-    print("Indexed %d files (%s) in %.1fs (%d files/s, incl. %.0fs compact)"
-          % (count, human_size(total_bytes), dt, rate, time.time() - t1))
-    if with_symbols:
-        print("Recorded %d exposed symbols and %d include edges from headers"
-              % (n_symbols, n_includes))
-    print("Index size: %s -> %s" %
-          (human_size(os.path.getsize(db_path)), db_path))
-    if errors:
-        print("Warning: %d scan errors; snapshot is incomplete" % errors)
+        dt = time.time() - t0
+        rate = int(count / dt) if dt > 0 else count
+        print("Indexed %d files (%s) in %.1fs (%d files/s, incl. %.0fs compact)"
+              % (count, human_size(total_bytes), dt, rate, time.time() - t1))
+        if with_symbols:
+            print("Recorded %d exposed symbols and %d include edges from headers"
+                  % (n_symbols, n_includes))
+        print("Index size: %s -> %s" %
+              (human_size(os.path.getsize(db_path)), db_path))
+        if errors:
+            print("Warning: %d scan errors; snapshot is incomplete" % errors)
 
 
 # ---------------------------------------------------------------------------
@@ -728,91 +728,91 @@ def print_symbol_summary(matched):
 
 
 def cmd_lookup(args):
-    db = open_db_required(resolve_db(args))
-    if db.execute("SELECT COUNT(*) FROM symbols").fetchone()[0] == 0:
-        print("(no symbols in index - re-run: repoindex.py index <root>)",
-              file=sys.stderr)
-    root_row = db.execute("SELECT value FROM meta WHERE key='root'").fetchone()
-    hint_root = root_row[0] if root_row else ""
-
-    names = list(args.names or [])
-    log_counts = {}
-    if args.from_log:
-        try:
-            with open(args.from_log, "r", encoding="utf-8",
-                      errors="replace") as f:
-                text = f.read()
-        except OSError as e:
-            sys.exit("Cannot read log: %s" % e)
-        counts = Counter()
-        stopped = junk = 0
-        for tok in LOG_TOKEN_RE.findall(text):
-            if not plausible_symbol_token(tok):
-                continue
-            if not args.no_stoplist and tok.upper() in LOG_STOPLIST:
-                stopped += 1
-                continue
-            if is_junk_token(tok):
-                junk += 1
-                continue
-            counts[tok] += 1
-        rare = 0
-        for tok, c in counts.items():
-            if c < args.min_count:
-                rare += 1
-            else:
-                log_counts[tok] = c
-        print("Extracted %d candidate tokens from %s"
-              % (len(log_counts), args.from_log), file=sys.stderr)
-        notes = []
-        if stopped:
-            notes.append("%d noise" % stopped)
-        if junk:
-            notes.append("%d junk-shaped" % junk)
-        if rare:
-            notes.append("%d below --min-count %d" % (rare, args.min_count))
-        if notes:
-            print("Filtered out: " + ", ".join(notes) +
-                  " (widen with --no-stoplist / --min-count 1)",
+    with closing(open_db_required(resolve_db(args))) as db:
+        if db.execute("SELECT COUNT(*) FROM symbols").fetchone()[0] == 0:
+            print("(no symbols in index - re-run: repoindex.py index <root>)",
                   file=sys.stderr)
-        # most frequent in the log first
-        names.extend(sorted(log_counts, key=lambda t: (-log_counts[t], t)))
+        root_row = db.execute("SELECT value FROM meta WHERE key='root'").fetchone()
+        hint_root = root_row[0] if root_row else ""
 
-    if not names:
-        sys.exit("Give at least one symbol name, or --from-log <file>")
+        names = list(args.names or [])
+        log_counts = {}
+        if args.from_log:
+            try:
+                with open(args.from_log, "r", encoding="utf-8",
+                          errors="replace") as f:
+                    text = f.read()
+            except OSError as e:
+                sys.exit("Cannot read log: %s" % e)
+            counts = Counter()
+            stopped = junk = 0
+            for tok in LOG_TOKEN_RE.findall(text):
+                if not plausible_symbol_token(tok):
+                    continue
+                if not args.no_stoplist and tok.upper() in LOG_STOPLIST:
+                    stopped += 1
+                    continue
+                if is_junk_token(tok):
+                    junk += 1
+                    continue
+                counts[tok] += 1
+            rare = 0
+            for tok, c in counts.items():
+                if c < args.min_count:
+                    rare += 1
+                else:
+                    log_counts[tok] = c
+            print("Extracted %d candidate tokens from %s"
+                  % (len(log_counts), args.from_log), file=sys.stderr)
+            notes = []
+            if stopped:
+                notes.append("%d noise" % stopped)
+            if junk:
+                notes.append("%d junk-shaped" % junk)
+            if rare:
+                notes.append("%d below --min-count %d" % (rare, args.min_count))
+            if notes:
+                print("Filtered out: " + ", ".join(notes) +
+                      " (widen with --no-stoplist / --min-count 1)",
+                      file=sys.stderr)
+            # most frequent in the log first
+            names.extend(sorted(log_counts, key=lambda t: (-log_counts[t], t)))
 
-    explicit = bool(args.names) and not args.from_log
-    verbose = args.verbose or explicit
-    hits = misses = raw = 0
-    matched = []   # (symbol_name, rows, log_count)
-    for name in names:
-        groups = lookup_symbol(db, name, substr=args.substr)
-        if not groups:
-            misses += 1
-            if not args.from_log:
-                print("## %s - no match in index\n" % name)
-            continue
-        hits += 1
-        for sym in sorted(groups):
-            rows = groups[sym]
-            raw += len(rows)
-            matched.append((sym, rows, log_counts.get(name, 0)))
+        if not names:
+            sys.exit("Give at least one symbol name, or --from-log <file>")
 
-    if args.from_log:
-        matched.sort(key=lambda t: (-t[2], t[0]))
-        if not args.no_summary or args.summary_only:
-            print_symbol_summary(matched)
-        if not args.summary_only:
-            for name, rows, lc in matched:
-                print_symbol(db, name, rows, verbose, log_count=lc,
-                             max_defs=args.max_defs, hint_root=hint_root)
-    else:
-        for name, rows, _lc in matched:
-            print_symbol(db, name, rows, verbose)
-    if args.from_log:
-        print("%d/%d tokens matched a header symbol (%d unmatched; %d raw "
-              "rows collapsed into the report above)"
-              % (hits, hits + misses, misses, raw), file=sys.stderr)
+        explicit = bool(args.names) and not args.from_log
+        verbose = args.verbose or explicit
+        hits = misses = raw = 0
+        matched = []   # (symbol_name, rows, log_count)
+        for name in names:
+            groups = lookup_symbol(db, name, substr=args.substr)
+            if not groups:
+                misses += 1
+                if not args.from_log:
+                    print("## %s - no match in index\n" % name)
+                continue
+            hits += 1
+            for sym in sorted(groups):
+                rows = groups[sym]
+                raw += len(rows)
+                matched.append((sym, rows, log_counts.get(name, 0)))
+
+        if args.from_log:
+            matched.sort(key=lambda t: (-t[2], t[0]))
+            if not args.no_summary or args.summary_only:
+                print_symbol_summary(matched)
+            if not args.summary_only:
+                for name, rows, lc in matched:
+                    print_symbol(db, name, rows, verbose, log_count=lc,
+                                 max_defs=args.max_defs, hint_root=hint_root)
+        else:
+            for name, rows, _lc in matched:
+                print_symbol(db, name, rows, verbose)
+        if args.from_log:
+            print("%d/%d tokens matched a header symbol (%d unmatched; %d raw "
+                  "rows collapsed into the report above)"
+                  % (hits, hits + misses, misses, raw), file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -1081,62 +1081,62 @@ def symbols_out_dir(db, args):
 
 
 def cmd_symbols(args):
-    db = open_db_required(resolve_db(args))
+    with closing(open_db_required(resolve_db(args))) as db:
 
-    if args.out_dir:
-        symbols_out_dir(db, args)
-        return
+        if args.out_dir:
+            symbols_out_dir(db, args)
+            return
 
-    sql, params = symbol_query(args)
-    if getattr(args, "dedup", False):
-        sql = sql.rsplit("ORDER BY", 1)[0] + \
-            "ORDER BY name COLLATE NOCASE, kind, decl, path"
-    cur = db.execute(sql, params)
-    if args.out:
-        with open(args.out, "w", encoding="utf-8") as f:
-            if getattr(args, "dedup", False):
-                n = write_symbols_dedup(f, cur, args)
-            else:
-                n = write_symbols_md(f, "Symbol index", cur,
-                                     "Generated %s. Complete inventory of "
-                                     "exposed classes, structs, enums, "
-                                     "unions, macros and global variables - "
-                                     "no cutouts." % date.today().isoformat(),
-                                     args)
-        print("Wrote %s (%d symbols)" % (args.out, n))
-    elif getattr(args, "dedup", False):
-        n = 0
-        cur_key, cur_paths = None, []
-        for name, kind, decl, path in cur:
-            if not keep_row(args, name, kind, decl):
-                continue
-            key = (name, kind, decl)
-            if key != cur_key:
-                if cur_key is not None:
-                    print("%-40s %-7s %d header(s): %s" % (
-                        cur_key[0], cur_key[1], len(cur_paths),
-                        "; ".join(cur_paths)))
-                    n += 1
-                cur_key, cur_paths = key, []
-            cur_paths.append(path)
-        if cur_key is not None:
-            print("%-40s %-7s %d header(s): %s" % (
-                cur_key[0], cur_key[1], len(cur_paths), "; ".join(cur_paths)))
-            n += 1
-        print("%d unique symbols" % n, file=sys.stderr)
-    else:
-        n = 0
-        for name, kind, decl, path in cur:
-            if not keep_row(args, name, kind, decl):
-                continue
-            print("%-40s %-7s %s" % (name, kind, path))
-            n += 1
-        print("%d symbols" % n, file=sys.stderr)
-    if n == 0 and not (args.kind or args.pattern or
-                       getattr(args, "path_prefix", None)):
-        print("(0 symbols in the index - it was not built yet or predates\n"
-              " symbol support; run: python3 repoindex.py index <root>)",
-              file=sys.stderr)
+        sql, params = symbol_query(args)
+        if getattr(args, "dedup", False):
+            sql = sql.rsplit("ORDER BY", 1)[0] + \
+                "ORDER BY name COLLATE NOCASE, kind, decl, path"
+        cur = db.execute(sql, params)
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as f:
+                if getattr(args, "dedup", False):
+                    n = write_symbols_dedup(f, cur, args)
+                else:
+                    n = write_symbols_md(f, "Symbol index", cur,
+                                         "Generated %s. Complete inventory of "
+                                         "exposed classes, structs, enums, "
+                                         "unions, macros and global variables - "
+                                         "no cutouts." % date.today().isoformat(),
+                                         args)
+            print("Wrote %s (%d symbols)" % (args.out, n))
+        elif getattr(args, "dedup", False):
+            n = 0
+            cur_key, cur_paths = None, []
+            for name, kind, decl, path in cur:
+                if not keep_row(args, name, kind, decl):
+                    continue
+                key = (name, kind, decl)
+                if key != cur_key:
+                    if cur_key is not None:
+                        print("%-40s %-7s %d header(s): %s" % (
+                            cur_key[0], cur_key[1], len(cur_paths),
+                            "; ".join(cur_paths)))
+                        n += 1
+                    cur_key, cur_paths = key, []
+                cur_paths.append(path)
+            if cur_key is not None:
+                print("%-40s %-7s %d header(s): %s" % (
+                    cur_key[0], cur_key[1], len(cur_paths), "; ".join(cur_paths)))
+                n += 1
+            print("%d unique symbols" % n, file=sys.stderr)
+        else:
+            n = 0
+            for name, kind, decl, path in cur:
+                if not keep_row(args, name, kind, decl):
+                    continue
+                print("%-40s %-7s %s" % (name, kind, path))
+                n += 1
+            print("%d symbols" % n, file=sys.stderr)
+        if n == 0 and not (args.kind or args.pattern or
+                           getattr(args, "path_prefix", None)):
+            print("(0 symbols in the index - it was not built yet or predates\n"
+                  " symbol support; run: python3 repoindex.py index <root>)",
+                  file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -1366,20 +1366,19 @@ def emit_guide(args, text):
 
 
 def cmd_status(args):
-    db = open_db_required(resolve_db(args))
-    meta = dict(db.execute("SELECT key,value FROM meta"))
-    db.close()
-    report = {"metadata": meta, "live_tree_verified": False,
-              "coverage_known": all(k in meta for k in
-                  ("error_count", "ignore_directories", "symbols_enabled"))}
-    if args.json:
-        print(json.dumps(report, indent=2, sort_keys=True))
-    else:
-        print("Stored snapshot (not a live freshness check):")
-        for key, value in sorted(meta.items()):
-            print("  %s: %s" % (key, value))
-        if not report["coverage_known"]:
-            print("Coverage metadata unavailable in this older index; rebuild explicitly if needed.")
+    with closing(open_db_required(resolve_db(args))) as db:
+        meta = dict(db.execute("SELECT key,value FROM meta"))
+        report = {"metadata": meta, "live_tree_verified": False,
+                  "coverage_known": all(k in meta for k in
+                      ("error_count", "ignore_directories", "symbols_enabled"))}
+        if args.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            print("Stored snapshot (not a live freshness check):")
+            for key, value in sorted(meta.items()):
+                print("  %s: %s" % (key, value))
+            if not report["coverage_known"]:
+                print("Coverage metadata unavailable in this older index; rebuild explicitly if needed.")
 
 
 def compact_agentsmd(root, title, db_path, total_files, total_bytes,
@@ -1420,206 +1419,203 @@ def cmd_agentsmd(args):
         cmd_index(argparse.Namespace(
             root=root, db=db_path, no_ignore=False,
             ignore=args.ignore, no_symbols=False, jobs=0))
-    db = open_db_required(db_path)
-    meta = dict(db.execute("SELECT key, value FROM meta"))
-    if os.path.realpath(meta.get("root", "")) != os.path.realpath(root):
-        db.close()
-        sys.exit("Index root does not match requested root; select the correct "
-                 "--db or explicitly --reindex.")
-    name = os.path.basename(root.rstrip(os.sep)) or root
-    title = args.title or "%s - agent guide" % name
-    if getattr(args, "compact", False):
-        totals = db.execute("SELECT COUNT(*), COALESCE(SUM(size),0) FROM files").fetchone()
-        ns = db.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
-        nh = db.execute("SELECT COUNT(*) FROM (SELECT dir_id,file FROM symbols "
-                        "GROUP BY dir_id,file)").fetchone()[0]
-        text = compact_agentsmd(root, title, db_path, *totals, ns, nh)
-        db.close()
-        emit_guide(args, snapshot_note(meta) + text)
-        return
-    rows = db.execute("SELECT path, size FROM vfiles").fetchall()
-    ext_rows = db.execute(
-        "SELECT ext, COUNT(*), SUM(size) FROM vfiles GROUP BY ext "
-        "ORDER BY SUM(size) DESC").fetchall()
-    n_symbols = db.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
-    n_sym_headers = db.execute(
-        "SELECT COUNT(DISTINCT dir_id || ':' || file) "
-        "FROM symbols").fetchone()[0]
-    total_files = len(rows)
-    total_bytes = sum(r[1] for r in rows)
-    counts, sizes = dir_aggregates(rows)
+    with closing(open_db_required(db_path)) as db:
+        meta = dict(db.execute("SELECT key, value FROM meta"))
+        if os.path.realpath(meta.get("root", "")) != os.path.realpath(root):
+            sys.exit("Index root does not match requested root; select the correct "
+                     "--db or explicitly --reindex.")
+        name = os.path.basename(root.rstrip(os.sep)) or root
+        title = args.title or "%s - agent guide" % name
+        if getattr(args, "compact", False):
+            totals = db.execute("SELECT COUNT(*), COALESCE(SUM(size),0) FROM files").fetchone()
+            ns = db.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
+            nh = db.execute("SELECT COUNT(*) FROM (SELECT dir_id,file FROM symbols "
+                            "GROUP BY dir_id,file)").fetchone()[0]
+            text = compact_agentsmd(root, title, db_path, *totals, ns, nh)
+            emit_guide(args, snapshot_note(meta) + text)
+            return
+        rows = db.execute("SELECT path, size FROM vfiles").fetchall()
+        ext_rows = db.execute(
+            "SELECT ext, COUNT(*), SUM(size) FROM vfiles GROUP BY ext "
+            "ORDER BY SUM(size) DESC").fetchall()
+        n_symbols = db.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
+        n_sym_headers = db.execute(
+            "SELECT COUNT(DISTINCT dir_id || ':' || file) "
+            "FROM symbols").fetchone()[0]
+        total_files = len(rows)
+        total_bytes = sum(r[1] for r in rows)
+        counts, sizes = dir_aggregates(rows)
 
-    name = os.path.basename(root.rstrip(os.sep)) or root
-    title = args.title or "%s - agent guide" % name
-    today = meta.get("updated", "unknown")
-    depth = args.depth
+        name = os.path.basename(root.rstrip(os.sep)) or root
+        title = args.title or "%s - agent guide" % name
+        today = meta.get("updated", "unknown")
+        depth = args.depth
 
-    L = []
-    L.append("# %s" % title)
-    L.append("")
-    L.append("Index snapshot: %s. Structural sections (trees, census, header/symbol "
-             "map) are generated in full from the file index - no sampling, "
-             "no cutouts." % today)
-    L.append("")
-    L.append("Regenerate:")
-    L.append("```sh")
-    L.append("python3 repoindex.py index %s" % root)
-    L.append("python3 repoindex.py agentsmd %s --out %s"
-             % (root, args.out or "AGENTS.md"))
-    L.append("```")
-    L.append("")
-
-    L.append("## Workspace roles")
-    L.append("")
-    L.append("<!-- TODO(curate): one bullet per tree: buildable vs read-only "
-             "reference, device/codename targets, tooling paths. -->")
-    L.append("")
-    L.append("- `%s`: %d files, %s total." %
-             (root, total_files, human_size(total_bytes)))
-    L.append("")
-
-    L.append("## Directory map")
-    L.append("")
-    L.append("Recursive file counts and sizes, every directory to depth %d."
-             % depth)
-    L.append("")
-    L.append("```")
-    dirs_sorted = sorted(d for d in counts if d.count("/") < depth)
-    for d in dirs_sorted:
-        indent = "  " * d.count("/")
-        L.append("%s%-40s %10d files  %12s" % (
-            indent, os.path.basename(d) + "/", counts[d],
-            human_size(sizes[d])))
-    L.append("```")
-    L.append("")
-
-    L.append("## File-type census")
-    L.append("")
-    L.append("Every extension present in the tree, sorted by total bytes.")
-    L.append("")
-    L.append("| Extension | Files | Bytes |")
-    L.append("|-----------|------:|------:|")
-    for ext, cnt, byt in ext_rows:
-        L.append("| `%s` | %d | %s |" % (ext or "(none)", cnt,
-                                          human_size(byt or 0)))
-    L.append("")
-
-    if getattr(args, "key_files", False):
-        L.append("## Key files")
+        L = []
+        L.append("# %s" % title)
         L.append("")
-        L.append("Every known build/config/doc file in the tree, grouped by "
-                 "file name. Complete lists, no cutouts.")
+        L.append("Index snapshot: %s. Structural sections (trees, census, header/symbol "
+                 "map) are generated in full from the file index - no sampling, "
+                 "no cutouts." % today)
         L.append("")
-        by_name = defaultdict(list)
-        for (p, _s) in rows:
-            base = p.rsplit("/", 1)[-1]
-            if KEY_FILE_RE.match(base):
-                by_name[base].append(p)
-        if not by_name:
-            L.append("No known build/doc/config files found.")
+        L.append("Regenerate:")
+        L.append("```sh")
+        L.append("python3 repoindex.py index %s" % root)
+        L.append("python3 repoindex.py agentsmd %s --out %s"
+                 % (root, args.out or "AGENTS.md"))
+        L.append("```")
+        L.append("")
+
+        L.append("## Workspace roles")
+        L.append("")
+        L.append("<!-- TODO(curate): one bullet per tree: buildable vs read-only "
+                 "reference, device/codename targets, tooling paths. -->")
+        L.append("")
+        L.append("- `%s`: %d files, %s total." %
+                 (root, total_files, human_size(total_bytes)))
+        L.append("")
+
+        L.append("## Directory map")
+        L.append("")
+        L.append("Recursive file counts and sizes, every directory to depth %d."
+                 % depth)
+        L.append("")
+        L.append("```")
+        dirs_sorted = sorted(d for d in counts if d.count("/") < depth)
+        for d in dirs_sorted:
+            indent = "  " * d.count("/")
+            L.append("%s%-40s %10d files  %12s" % (
+                indent, os.path.basename(d) + "/", counts[d],
+                human_size(sizes[d])))
+        L.append("```")
+        L.append("")
+
+        L.append("## File-type census")
+        L.append("")
+        L.append("Every extension present in the tree, sorted by total bytes.")
+        L.append("")
+        L.append("| Extension | Files | Bytes |")
+        L.append("|-----------|------:|------:|")
+        for ext, cnt, byt in ext_rows:
+            L.append("| `%s` | %d | %s |" % (ext or "(none)", cnt,
+                                              human_size(byt or 0)))
+        L.append("")
+
+        if getattr(args, "key_files", False):
+            L.append("## Key files")
             L.append("")
+            L.append("Every known build/config/doc file in the tree, grouped by "
+                     "file name. Complete lists, no cutouts.")
+            L.append("")
+            by_name = defaultdict(list)
+            for (p, _s) in rows:
+                base = p.rsplit("/", 1)[-1]
+                if KEY_FILE_RE.match(base):
+                    by_name[base].append(p)
+            if not by_name:
+                L.append("No known build/doc/config files found.")
+                L.append("")
+            else:
+                for base in sorted(by_name, key=str.lower):
+                    paths = sorted(by_name[base])
+                    plural = "" if len(paths) == 1 else "s"
+                    L.append("**`%s`** - %d file%s:" % (base, len(paths), plural))
+                    L.append("")
+                    L.append("```")
+                    L.extend(paths)
+                    L.append("```")
+                    L.append("")
+
+        L.append("## Header and symbol index")
+        L.append("")
+        hdr_counts = defaultdict(int)
+        for (p, _s) in rows:
+            ext = os.path.splitext(p)[1].lower()
+            if ext in HEADER_EXTS:
+                hdr_counts[p.split("/", 1)[0]] += 1
+        total_hdr = sum(hdr_counts.values())
+        L.append("%d C/C++ headers (%s) in the tree; the SQLite index maps **%d "
+                 "exposed symbols** (classes, structs, enums, unions, macros and "
+                 "global variables) across %d headers, plus the full include "
+                 "graph." %
+                 (total_hdr, ", ".join(sorted(HEADER_EXTS)), n_symbols,
+                  n_sym_headers))
+        L.append("")
+        for top in sorted(hdr_counts):
+            L.append("- `%s/`: %d headers" % (top, hdr_counts[top]))
+        L.append("")
+        L.append("The index lives at `%s` (compact, normalized). Query it "
+                 "directly, or dump readable markdown per component:" % db_path)
+        L.append("```sh")
+        L.append("# find which header exposes a class seen in logs:")
+        L.append("python3 repoindex.py lookup CameraMode Timer")
+        L.append("# cross-check a whole logcat against the index (ranked")
+        L.append("# summary table first; mega-symbols collapse to digests):")
+        L.append("python3 repoindex.py lookup --from-log /path/to/logcat.txt \\")
+        L.append("    --root <tree> --min-count 3")
+        L.append("# split into per-component markdown, adaptive file sizes:")
+        L.append("python3 repoindex.py symbols --out-dir SYMBOLS/   "
+                 "# splits any file over --max-per-file (default 100000)")
+        L.append("# or a single component only:")
+        L.append("python3 repoindex.py symbols --path-prefix <component> \\")
+        L.append("    --out <component>-symbols.md")
+        L.append("```")
+        L.append("")
+        L.extend(token_rules_lines())
+        L.append("")
+        L.append("Generate a complete per-header inventory (declarations + "
+                 "includes, no cutouts):")
+        L.append("```sh")
+        L.append("python3 repoindex.py headers %s --subdir <dir> --recursive \\"
+                 % root)
+        L.append("    --title \"Header index\" --out HEADERS.md")
+        L.append("```")
+        L.append("")
+
+        L.extend(case_table_lines(db_path))
+        L.append("## Efficient searches")
+        L.append("")
+        tops = sorted(d for d in counts if "/" not in d)
+        L.append("Narrow to a component first; search from `%s`:" % root)
+        L.append("")
+        L.append("```sh")
+        L.append("rg -n 'pattern' %s" % (" ".join(tops[:4]) if tops else "."))
+        L.append("# include hidden/ignored files and cross-check empty results:")
+        L.append("rg -uuu -n 'pattern' %s" % (tops[0] if tops else "."))
+        L.append("```")
+        L.append("")
+        L.append("Query the file index directly:")
+        L.append("")
+        L.append("```sh")
+        L.append("python3 repoindex.py search '*.bp' --db %s" % db_path)
+        L.append("python3 repoindex.py tree --db %s --depth 3" % db_path)
+        L.append("```")
+        L.append("")
+        L.append("```sql")
+        L.append("-- which headers expose a symbol")
+        L.append("SELECT name, kind, path FROM vsymbols WHERE name = 'CameraMode';")
+        L.append("-- who includes a header")
+        L.append("SELECT DISTINCT path FROM vincludes WHERE target = 'CameraMode.h';")
+        L.append("-- files changed most recently")
+        L.append("SELECT path, datetime(mtime,'unixepoch') AS modified")
+        L.append("FROM vfiles ORDER BY mtime DESC LIMIT 50;")
+        L.append("```")
+        L.append("")
+
+        L.append("## Verified observations and open leads")
+        L.append("")
+        L.append("<!-- TODO(curate): hand-maintained findings. Generated sections "
+                 "above are rebuilt from the index. Put curated instructions "
+                 "outside the repoindex:begin/end markers so regeneration "
+                 "preserves them. -->")
+        L.append("")
+
+        if getattr(args, "compact", False):
+            text = compact_agentsmd(root, title, db_path, total_files,
+                                    total_bytes, n_symbols, n_sym_headers)
         else:
-            for base in sorted(by_name, key=str.lower):
-                paths = sorted(by_name[base])
-                plural = "" if len(paths) == 1 else "s"
-                L.append("**`%s`** - %d file%s:" % (base, len(paths), plural))
-                L.append("")
-                L.append("```")
-                L.extend(paths)
-                L.append("```")
-                L.append("")
-
-    L.append("## Header and symbol index")
-    L.append("")
-    hdr_counts = defaultdict(int)
-    for (p, _s) in rows:
-        ext = os.path.splitext(p)[1].lower()
-        if ext in HEADER_EXTS:
-            hdr_counts[p.split("/", 1)[0]] += 1
-    total_hdr = sum(hdr_counts.values())
-    L.append("%d C/C++ headers (%s) in the tree; the SQLite index maps **%d "
-             "exposed symbols** (classes, structs, enums, unions, macros and "
-             "global variables) across %d headers, plus the full include "
-             "graph." %
-             (total_hdr, ", ".join(sorted(HEADER_EXTS)), n_symbols,
-              n_sym_headers))
-    L.append("")
-    for top in sorted(hdr_counts):
-        L.append("- `%s/`: %d headers" % (top, hdr_counts[top]))
-    L.append("")
-    L.append("The index lives at `%s` (compact, normalized). Query it "
-             "directly, or dump readable markdown per component:" % db_path)
-    L.append("```sh")
-    L.append("# find which header exposes a class seen in logs:")
-    L.append("python3 repoindex.py lookup CameraMode Timer")
-    L.append("# cross-check a whole logcat against the index (ranked")
-    L.append("# summary table first; mega-symbols collapse to digests):")
-    L.append("python3 repoindex.py lookup --from-log /path/to/logcat.txt \\")
-    L.append("    --root <tree> --min-count 3")
-    L.append("# split into per-component markdown, adaptive file sizes:")
-    L.append("python3 repoindex.py symbols --out-dir SYMBOLS/   "
-             "# splits any file over --max-per-file (default 100000)")
-    L.append("# or a single component only:")
-    L.append("python3 repoindex.py symbols --path-prefix <component> \\")
-    L.append("    --out <component>-symbols.md")
-    L.append("```")
-    L.append("")
-    L.extend(token_rules_lines())
-    L.append("")
-    L.append("Generate a complete per-header inventory (declarations + "
-             "includes, no cutouts):")
-    L.append("```sh")
-    L.append("python3 repoindex.py headers %s --subdir <dir> --recursive \\"
-             % root)
-    L.append("    --title \"Header index\" --out HEADERS.md")
-    L.append("```")
-    L.append("")
-
-    L.extend(case_table_lines(db_path))
-    L.append("## Efficient searches")
-    L.append("")
-    tops = sorted(d for d in counts if "/" not in d)
-    L.append("Narrow to a component first; search from `%s`:" % root)
-    L.append("")
-    L.append("```sh")
-    L.append("rg -n 'pattern' %s" % (" ".join(tops[:4]) if tops else "."))
-    L.append("# include hidden/ignored files and cross-check empty results:")
-    L.append("rg -uuu -n 'pattern' %s" % (tops[0] if tops else "."))
-    L.append("```")
-    L.append("")
-    L.append("Query the file index directly:")
-    L.append("")
-    L.append("```sh")
-    L.append("python3 repoindex.py search '*.bp' --db %s" % db_path)
-    L.append("python3 repoindex.py tree --db %s --depth 3" % db_path)
-    L.append("```")
-    L.append("")
-    L.append("```sql")
-    L.append("-- which headers expose a symbol")
-    L.append("SELECT name, kind, path FROM vsymbols WHERE name = 'CameraMode';")
-    L.append("-- who includes a header")
-    L.append("SELECT DISTINCT path FROM vincludes WHERE target = 'CameraMode.h';")
-    L.append("-- files changed most recently")
-    L.append("SELECT path, datetime(mtime,'unixepoch') AS modified")
-    L.append("FROM vfiles ORDER BY mtime DESC LIMIT 50;")
-    L.append("```")
-    L.append("")
-
-    L.append("## Verified observations and open leads")
-    L.append("")
-    L.append("<!-- TODO(curate): hand-maintained findings. Generated sections "
-             "above are rebuilt from the index. Put curated instructions "
-             "outside the repoindex:begin/end markers so regeneration "
-             "preserves them. -->")
-    L.append("")
-
-    if getattr(args, "compact", False):
-        text = compact_agentsmd(root, title, db_path, total_files,
-                                total_bytes, n_symbols, n_sym_headers)
-    else:
-        text = "\n".join(L).rstrip() + "\n"
-    db.close()
-    emit_guide(args, snapshot_note(meta) + text)
+            text = "\n".join(L).rstrip() + "\n"
+        emit_guide(args, snapshot_note(meta) + text)
 
 
 # ---------------------------------------------------------------------------
@@ -1627,115 +1623,115 @@ def cmd_agentsmd(args):
 # ---------------------------------------------------------------------------
 
 def cmd_stats(args):
-    db = open_db_required(resolve_db(args))
-    total_files, total_bytes = db.execute(
-        "SELECT COUNT(*), COALESCE(SUM(size),0) FROM vfiles").fetchone()
-    n_symbols = db.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
-    n_includes = db.execute("SELECT COUNT(*) FROM includes").fetchone()[0]
-    n_dirs = db.execute("SELECT COUNT(*) FROM dirs").fetchone()[0]
-    print("Files: %d   Bytes: %s   Symbols: %d   Include edges: %d   Dirs: %d"
-          % (total_files, human_size(total_bytes), n_symbols, n_includes,
-             n_dirs))
-    print("\nPer-extension (all):")
-    for ext, cnt, byt in db.execute(
-            "SELECT ext, COUNT(*), SUM(size) FROM vfiles GROUP BY ext "
-            "ORDER BY SUM(size) DESC"):
-        print("  %-12s %10d  %12s" % (ext or "(none)", cnt,
-                                      human_size(byt or 0)))
-    limit = args.limit if args.limit and args.limit > 0 else None
-    q = "SELECT path, size FROM vfiles ORDER BY size DESC"
-    if limit:
-        q += " LIMIT %d" % limit
-    print("\nLargest files%s:" % ("" if not limit else " (top %d)" % limit))
-    for path, size in db.execute(q):
-        print("  %12s  %s" % (human_size(size), path))
+    with closing(open_db_required(resolve_db(args))) as db:
+        total_files, total_bytes = db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(size),0) FROM vfiles").fetchone()
+        n_symbols = db.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
+        n_includes = db.execute("SELECT COUNT(*) FROM includes").fetchone()[0]
+        n_dirs = db.execute("SELECT COUNT(*) FROM dirs").fetchone()[0]
+        print("Files: %d   Bytes: %s   Symbols: %d   Include edges: %d   Dirs: %d"
+              % (total_files, human_size(total_bytes), n_symbols, n_includes,
+                 n_dirs))
+        print("\nPer-extension (all):")
+        for ext, cnt, byt in db.execute(
+                "SELECT ext, COUNT(*), SUM(size) FROM vfiles GROUP BY ext "
+                "ORDER BY SUM(size) DESC"):
+            print("  %-12s %10d  %12s" % (ext or "(none)", cnt,
+                                          human_size(byt or 0)))
+        limit = args.limit if args.limit and args.limit > 0 else None
+        q = "SELECT path, size FROM vfiles ORDER BY size DESC"
+        if limit:
+            q += " LIMIT %d" % limit
+        print("\nLargest files%s:" % ("" if not limit else " (top %d)" % limit))
+        for path, size in db.execute(q):
+            print("  %12s  %s" % (human_size(size), path))
 
 
 def cmd_tree(args):
-    db = open_db_required(resolve_db(args))
-    rows = db.execute("SELECT path, size FROM vfiles").fetchall()
-    counts, sizes = dir_aggregates(rows)
-    dirs_sorted = sorted(d for d in counts if d.count("/") < args.depth)
-    for d in dirs_sorted:
-        indent = "  " * d.count("/")
-        print("%s%-40s %10d files  %12s" % (
-            indent, os.path.basename(d) + "/", counts[d],
-            human_size(sizes[d])))
+    with closing(open_db_required(resolve_db(args))) as db:
+        rows = db.execute("SELECT path, size FROM vfiles").fetchall()
+        counts, sizes = dir_aggregates(rows)
+        dirs_sorted = sorted(d for d in counts if d.count("/") < args.depth)
+        for d in dirs_sorted:
+            indent = "  " * d.count("/")
+            print("%s%-40s %10d files  %12s" % (
+                indent, os.path.basename(d) + "/", counts[d],
+                human_size(sizes[d])))
 
 
 def cmd_search(args):
-    db = open_db_required(resolve_db(args))
-    pat = args.pattern
-    sql = "SELECT path, size FROM vfiles WHERE "
-    conds, params = [], []
-    if any(c in pat for c in "*?"):
-        if "/" in pat or pat.startswith("*"):
-            conds.append("path GLOB ?")
-            params.append(pat)
+    with closing(open_db_required(resolve_db(args))) as db:
+        pat = args.pattern
+        sql = "SELECT path, size FROM vfiles WHERE "
+        conds, params = [], []
+        if any(c in pat for c in "*?"):
+            if "/" in pat or pat.startswith("*"):
+                conds.append("path GLOB ?")
+                params.append(pat)
+            else:
+                conds.append("(path GLOB ? OR path GLOB ?)")
+                params += ["*/" + pat, pat]
         else:
-            conds.append("(path GLOB ? OR path GLOB ?)")
-            params += ["*/" + pat, pat]
-    else:
-        conds.append("path LIKE ?")
-        params.append("%" + pat + "%")
-    if args.ext:
-        conds.append("ext = ?")
-        params.append(args.ext if args.ext.startswith(".")
-                      else "." + args.ext)
-    prefix = getattr(args, "path_prefix", None)
-    if prefix:
-        # Bound a directory, not similarly named siblings; avoid LIKE wildcards.
-        prefix = prefix.replace("\\", "/").strip("/")
-        conds.append("(path = ? OR substr(path, 1, ?) = ?)")
-        params.extend([prefix, len(prefix) + 1, prefix + "/"])
-    sql += " AND ".join(conds) + " ORDER BY path"
-    if args.limit and args.limit > 0:
-        sql += " LIMIT %d" % args.limit
-    count = 0
-    for path, size in db.execute(sql, params):
-        count += 1
-        if getattr(args, "json", False):
-            print(json.dumps({"path": path, "size": size}))
-        elif getattr(args, "paths_only", False):
-            print(path)
-        else:
-            print("%12s  %s" % (human_size(size), path))
-    print("%d matches%s" % (count, " (limit reached; more may exist)"
-          if args.limit and count == args.limit else ""), file=sys.stderr)
+            conds.append("path LIKE ?")
+            params.append("%" + pat + "%")
+        if args.ext:
+            conds.append("ext = ?")
+            params.append(args.ext if args.ext.startswith(".")
+                          else "." + args.ext)
+        prefix = getattr(args, "path_prefix", None)
+        if prefix:
+            # Bound a directory, not similarly named siblings; avoid LIKE wildcards.
+            prefix = prefix.replace("\\", "/").strip("/")
+            conds.append("(path = ? OR substr(path, 1, ?) = ?)")
+            params.extend([prefix, len(prefix) + 1, prefix + "/"])
+        sql += " AND ".join(conds) + " ORDER BY path"
+        if args.limit and args.limit > 0:
+            sql += " LIMIT %d" % args.limit
+        count = 0
+        for path, size in db.execute(sql, params):
+            count += 1
+            if getattr(args, "json", False):
+                print(json.dumps({"path": path, "size": size}))
+            elif getattr(args, "paths_only", False):
+                print(path)
+            else:
+                print("%12s  %s" % (human_size(size), path))
+        print("%d matches%s" % (count, " (limit reached; more may exist)"
+              if args.limit and count == args.limit else ""), file=sys.stderr)
 
 
 def cmd_dupes(args):
-    db = open_db_required(resolve_db(args))
-    root_row = db.execute("SELECT value FROM meta WHERE key='root'").fetchone()
-    root = root_row[0] if root_row else "."
-    groups = db.execute(
-        "SELECT size, COUNT(*) c FROM vfiles WHERE size > 0 "
-        "GROUP BY size HAVING c > 1 ORDER BY size*c DESC").fetchall()
-    print("%d same-size groups; hashing to verify..." % len(groups))
-    shown = 0
-    for size, _c in groups:
-        paths = [p for (p,) in db.execute(
-            "SELECT path FROM vfiles WHERE size = ?", (size,))]
-        hashes = defaultdict(list)
-        for p in paths:
-            try:
-                h = hashlib.sha1()
-                candidate = os.path.join(root, p)
-                if not stat.S_ISREG(os.lstat(candidate).st_mode):
+    with closing(open_db_required(resolve_db(args))) as db:
+        root_row = db.execute("SELECT value FROM meta WHERE key='root'").fetchone()
+        root = root_row[0] if root_row else "."
+        groups = db.execute(
+            "SELECT size, COUNT(*) c FROM vfiles WHERE size > 0 "
+            "GROUP BY size HAVING c > 1 ORDER BY size*c DESC").fetchall()
+        print("%d same-size groups; hashing to verify..." % len(groups))
+        shown = 0
+        for size, _c in groups:
+            paths = [p for (p,) in db.execute(
+                "SELECT path FROM vfiles WHERE size = ?", (size,))]
+            hashes = defaultdict(list)
+            for p in paths:
+                try:
+                    h = hashlib.sha1()
+                    candidate = os.path.join(root, p)
+                    if not stat.S_ISREG(os.lstat(candidate).st_mode):
+                        continue
+                    with open(candidate, "rb") as f:
+                        for chunk in iter(lambda: f.read(1 << 20), b""):
+                            h.update(chunk)
+                    hashes[h.hexdigest()].append(p)
+                except OSError:
                     continue
-                with open(candidate, "rb") as f:
-                    for chunk in iter(lambda: f.read(1 << 20), b""):
-                        h.update(chunk)
-                hashes[h.hexdigest()].append(p)
-            except OSError:
-                continue
-        for members in hashes.values():
-            if len(members) > 1:
-                shown += 1
-                print("\n%s x %d:" % (human_size(size), len(members)))
-                for m in sorted(members):
-                    print("  %s" % m)
-    print("\n%d duplicate sets" % shown)
+            for members in hashes.values():
+                if len(members) > 1:
+                    shown += 1
+                    print("\n%s x %d:" % (human_size(size), len(members)))
+                    for m in sorted(members):
+                        print("  %s" % m)
+        print("\n%d duplicate sets" % shown)
 
 
 # ---------------------------------------------------------------------------

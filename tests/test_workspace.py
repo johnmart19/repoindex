@@ -116,7 +116,7 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_paths_backend_when_trigram_extension_is_unavailable(self):
         import sqlite3
-        with sqlite3.connect(w.ensure_db(self.root, "alpha")) as db:
+        with contextlib.closing(sqlite3.connect(w.ensure_db(self.root, "alpha"))) as db, db:
             db.execute("DELETE FROM meta WHERE key IN ('search_schema','search_backend')")
             class WithoutTrigram:
                 def execute(self, sql, *args):
@@ -154,7 +154,7 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_trigram_and_ordered_path_query_plans(self):
         import sqlite3
-        with sqlite3.connect(w.ensure_db(self.root, "alpha")) as db:
+        with contextlib.closing(sqlite3.connect(w.ensure_db(self.root, "alpha"))) as db, db:
             sql, params = w.files_sql(db, "SharedMode", [""], 20)
             plan = str(db.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall())
             if w.manifest(self.root, "alpha")["metadata"]["search_backend"] == "trigram":

@@ -35,7 +35,7 @@ class ImplementationTests(unittest.TestCase):
         meta = w.manifest(self.root, "alpha")["metadata"]
         self.assertEqual("2", meta["implementation_count"])
         self.assertEqual(str(len(self.body.encode()) + (self.root / "alpha/src/helper.cc").stat().st_size), meta["implementation_bytes"])
-        with sqlite3.connect(w.ensure_db(self.root, "alpha")) as db:
+        with contextlib.closing(sqlite3.connect(w.ensure_db(self.root, "alpha"))) as db, db:
             body, sha = db.execute("SELECT body,source_sha256 FROM implementation_files WHERE path='src/engine.cpp'").fetchone()
         self.assertEqual(self.body, body)
         self.assertEqual(hashlib.sha256(self.body.encode()).hexdigest(), sha)
@@ -95,7 +95,7 @@ class ImplementationTests(unittest.TestCase):
         self.assertIn("rare_body_token", rows[0]["text"])
         self.assertLessEqual(len(rows[0]["text"]), 102)
         self.assertLessEqual(len(rows[0]["context"]), 1600)
-        with sqlite3.connect(w.ensure_db(self.root, "alpha")) as db:
+        with contextlib.closing(sqlite3.connect(w.ensure_db(self.root, "alpha"))) as db, db:
             self.assertEqual(body, db.execute("SELECT body FROM implementation_files WHERE path='src/engine.cpp'").fetchone()[0])
 
     def test_decode_and_newline_normalization_preserves_searchable_tail(self):
