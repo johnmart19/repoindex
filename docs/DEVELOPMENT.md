@@ -20,6 +20,7 @@ The package lives in `src/repoindex/`. Read only the module relevant to a change
 | `workspace_cli.py`, `cli.py` | Workspace arguments/output and application dispatch |
 | `lookup.py`, `reports.py`, `guides.py` | Legacy lookup, exports and protected guides |
 | `legacy_cli.py`, `legacy_queries.py` | Existing single-tree parser/read commands |
+| `checks.py` | Opt-in shared Markdown/budget checks; never loaded for searches |
 | `_compat.py` | Lazy pre-package exports; never an implementation dependency |
 
 Core services do not import the CLI or compatibility files. Workspace builds call
@@ -55,6 +56,8 @@ Setuptools/wheel/pip/venv are development/install tools, not query dependencies.
 Do not publish to PyPI or alter shell startup files as part of ordinary updates.
 
 ## Checks
+
+Run these from the tool checkout root, not the consuming source workspace.
 
 ```bash
 python3 scripts/check.py

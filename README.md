@@ -46,7 +46,7 @@ Read only the documentation needed:
 - [Advanced single-tree commands](docs/LEGACY.md)
 - [Development, package layout and installation tests](docs/DEVELOPMENT.md)
 
-Run `python3 scripts/check.py` for standalone fixtures, documentation budgets and
+From the tool directory, run `python3 scripts/check.py` for standalone fixtures, documentation budgets and
 link/whitespace checks. It does not access a network, model, device or real source
 workspace. Ready Android bundles are maintained by
 [references_code](https://github.com/PocoF3Releases/references_code).

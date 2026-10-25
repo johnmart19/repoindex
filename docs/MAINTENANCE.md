@@ -76,5 +76,8 @@ not authorize future rewrites or changes to unrelated branches.
 Keep the complete tool directory when copying/vendoring. Runtime needs no pip
 packages: Linux/WSL, Python 3.8+ and SQLite with FTS5/trigram support suffice;
 ripgrep is optional except for live `text`. Validate changes with
-`python3 scripts/check.py` before publication. Preserve assertions and test the
+`python3 scripts/check.py` from the tool directory before publication. Preserve assertions and test the
 standalone package rather than depending on a particular source workspace.
+
+Workspace maintainers may reuse `repoindex.checks.documentation_errors` for
+local Markdown/link/budget checks. It never restores databases or scans sources.
