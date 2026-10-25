@@ -36,7 +36,7 @@ never remove indexed content.
 Requirements: Linux/WSL, Python 3.8+, SQLite 3.34+ with FTS5/trigram for ready
 content bundles. Ripgrep is needed only for `text`. No third-party Python packages.
 Keep the tool's Python files together; `python3 repoindex.py workspace …` is an
-equivalent entry point.
+equivalent entry point. The complete `src/` directory must be retained.
 
 Read only the documentation needed:
 
@@ -44,8 +44,13 @@ Read only the documentation needed:
 - [Maintenance and recovery](docs/MAINTENANCE.md)
 - [Storage and matching guarantees](docs/FORMAT.md)
 - [Advanced single-tree commands](docs/LEGACY.md)
+- [Development, package layout and installation tests](docs/DEVELOPMENT.md)
 
 Run `python3 scripts/check.py` for standalone fixtures, documentation budgets and
 link/whitespace checks. It does not access a network, model, device or real source
 workspace. Ready Android bundles are maintained by
 [references_code](https://github.com/PocoF3Releases/references_code).
+
+Optional installation exposes `repoindex workspace …` and `python3 -m repoindex …`.
+Use `pipx install /path/to/repoindex` for an isolated user installation. Direct
+checkout execution remains available without installation or runtime dependencies.

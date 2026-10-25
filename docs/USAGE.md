@@ -85,7 +85,7 @@ or operation failure, 3 first JSON record too large.
 
 ```python
 from pathlib import Path
-import workspace_index as workspace
+from repoindex import workspace
 
 root = Path('/path/to/workspace')
 for row in workspace.query(root, None, 'impl', 'Parser::parse', limit=10):
@@ -95,6 +95,7 @@ for block in workspace.read_source(root, ['platform'],
     print(block)
 ```
 
+Use the installed package, or put its `src/` directory on the Python import path.
 Reuse a process for related queries to amortize Python startup. No persistent
 server is needed. API records retain complete declarations; callers should bound
 what they display. `workspace_index.main` delegates to the same CLI.
@@ -108,3 +109,17 @@ can forward to `workspace_cli.main` instead of maintaining another parser.
 Benchmark configuration uses `query`; comparison accepts historical `pattern`
 records as well. Old file/header bundles remain queryable; missing body data
 requires an explicit maintainer ingestion, never an implicit startup rebuild.
+
+## Package layout (2.1)
+
+The implementation is under `src/repoindex/`; `repoindex.py` and the old
+`workspace_index`, `workspace_cli`, `implementation_index` files are compatibility
+routes. Existing directory/file commands and documented Python APIs remain valid.
+New code should use `from repoindex import workspace` and the installed
+`repoindex`/`python3 -m repoindex` entry points when available. The workspace's
+vendored directory remains independently runnable and pinned to its tested version.
+
+Core database failures raise `repoindex.database.IndexReadError` (a `ValueError`),
+not `SystemExit`. Legacy top-level helpers retain their process-exit behavior.
+When stopping a Python query iterator early, close it explicitly (for example with
+`contextlib.closing`) to release its read-only connection promptly.

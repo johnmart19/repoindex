@@ -2,7 +2,7 @@
 
 Keep this tool standalone. Workspace paths, scopes and benchmark queries belong
 in `repoindex.json`, never in Python code. Read README first and only the relevant
-document under `docs/`.
+document under `docs/`. Module ownership and package checks: [development](docs/DEVELOPMENT.md).
 
 - Queries are read-only and never ingest sources. Preserve immutable cache generations,
   atomic per-tree manifests and failed-build recovery.

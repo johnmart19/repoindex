@@ -13,9 +13,10 @@ import tempfile
 import unittest
 from unittest import mock
 
-SPEC = importlib.util.spec_from_file_location("repoindex", Path(__file__).resolve().parents[1] / "repoindex.py")
-r = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(r)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+import repoindex as r
+from repoindex import guides, scanner, legacy_queries
+
 
 
 class RepoindexTests(unittest.TestCase):
@@ -49,7 +50,7 @@ class RepoindexTests(unittest.TestCase):
         real_open = r.open_db_required
         for fail in (False, True):
             connection = real_open(str(self.db))
-            with mock.patch.object(r, "open_db_required", return_value=connection), contextlib.redirect_stderr(io.StringIO()):
+            with mock.patch.object(legacy_queries, "open_db_required", return_value=connection), contextlib.redirect_stderr(io.StringIO()):
                 if fail:
                     with mock.patch("builtins.print", side_effect=BrokenPipeError), self.assertRaises(BrokenPipeError):
                         r.cmd_search(args)
@@ -106,7 +107,7 @@ class RepoindexTests(unittest.TestCase):
             db.execute("DELETE FROM files")
 
     def test_guide_requires_explicit_scan(self):
-        with mock.patch.object(r, "cmd_index") as scan:
+        with mock.patch.object(guides, "build_index") as scan:
             with self.assertRaises(SystemExit):
                 self.guide()
             scan.assert_not_called()
@@ -122,7 +123,7 @@ class RepoindexTests(unittest.TestCase):
 
     def test_compact_avoids_full_inventory_aggregation(self):
         self.index()
-        with mock.patch.object(r, "dir_aggregates", side_effect=AssertionError("full scan")):
+        with mock.patch.object(guides, "dir_aggregates", side_effect=AssertionError("full scan")):
             self.guide()
         self.assertIn("snapshot", (self.root / "AGENTS.md").read_text())
 
@@ -211,7 +212,7 @@ class RepoindexTests(unittest.TestCase):
 
     def test_cli_defaults_to_compact_and_full_is_explicit(self):
         self.index()
-        tool = str(Path(r.__file__))
+        tool = str(Path(__file__).resolve().parents[1] / "repoindex.py")
         compact = subprocess.check_output([sys.executable, tool, "agentsmd", str(self.root)], text=True)
         self.assertNotIn("## Directory map", compact)
         full = subprocess.check_output([sys.executable, tool, "agentsmd", str(self.root), "--full"], text=True)
@@ -231,7 +232,7 @@ class RepoindexTests(unittest.TestCase):
         def fail_one(*args):
             files, symbols, includes, errors = original(*args)
             return files, symbols, includes, errors + 1
-        with mock.patch.object(r, "scan_directory", side_effect=fail_one):
+        with mock.patch.object(scanner, "scan_directory", side_effect=fail_one):
             self.index()
         warning = io.StringIO()
         with contextlib.redirect_stderr(warning):

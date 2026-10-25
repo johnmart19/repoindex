@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "repoindex"
+dynamic = ["version"]
+description = "Local, bounded source searches with portable SQLite bundles"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {file = "LICENSE"}
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/johnmart19/repoindex"
+
+[project.scripts]
+repoindex = "repoindex.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "repoindex._version.VERSION"}

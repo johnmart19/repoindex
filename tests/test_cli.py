@@ -9,9 +9,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import workspace_cli as cli
-import workspace_index as workspace
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from repoindex import workspace_cli as cli
+from repoindex import workspace as workspace
 
 
 class FrontendTests(unittest.TestCase):

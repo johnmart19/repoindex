@@ -9,8 +9,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import workspace_index as w
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from repoindex import workspace as w, verification
 
 class WorkspaceTests(unittest.TestCase):
     def setUp(self):
@@ -40,7 +40,7 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_cold_restore_after_move_never_scans(self):
         moved = self.moved()
-        with mock.patch.object(w.subprocess, "run", side_effect=AssertionError("must not scan")):
+        with mock.patch.object(w, "build_index", side_effect=AssertionError("must not scan")):
             rows = list(w.query(moved, None, "files", "Mode"))
         self.assertEqual(2, len(rows))
         for tree in ("alpha", "beta"):
@@ -134,14 +134,14 @@ class WorkspaceTests(unittest.TestCase):
         import subprocess
         w.ensure_db(self.root, "alpha")
         with w.lock(self.root, "alpha"):
-            result = subprocess.run([sys.executable, str(w.TOOL), "workspace", "search", "Mode", "--workspace", str(self.root), "--tree", "alpha"], capture_output=True, text=True, timeout=3)
+            result = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[1]), "workspace", "search", "Mode", "--workspace", str(self.root), "--tree", "alpha"], capture_output=True, text=True, timeout=3)
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("alpha/src/Mode.h", result.stdout)
 
     def test_verify_live_detects_changed_and_extra_source(self):
         incomplete = w.manifest(self.root, "alpha")
         incomplete["metadata"]["error_count"] = "1"
-        with mock.patch.object(w, "manifest", return_value=incomplete):
+        with mock.patch.object(verification, "manifest", return_value=incomplete):
             with self.assertRaisesRegex(ValueError, "incomplete scan"):
                 w.verify(self.root, "alpha")
         self.assertTrue(w.verify(self.root, "alpha", live=True)["live_metadata_verified"])
@@ -166,7 +166,7 @@ class WorkspaceTests(unittest.TestCase):
     def test_failed_build_preserves_published_manifest(self):
         path = self.root / "index/alpha/manifest.json"
         old = path.read_bytes()
-        with mock.patch.object(w.subprocess, "run", side_effect=RuntimeError("interrupted")):
+        with mock.patch.object(w, "build_index", side_effect=RuntimeError("interrupted")):
             with self.assertRaises(RuntimeError):
                 w.build(self.root, "alpha")
         self.assertEqual(old, path.read_bytes())

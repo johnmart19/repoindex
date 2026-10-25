@@ -1,0 +1,5 @@
+include AGENTS.md
+include repoindex.py workspace_index.py workspace_cli.py implementation_index.py __main__.py
+recursive-include docs *.md
+recursive-include scripts *.py
+recursive-include tests *.py

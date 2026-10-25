@@ -8,3 +8,10 @@ HEADERS.md
 # Python
 __pycache__/
 *.pyc
+
+# Local packaging and development environments
+build/
+dist/
+*.egg-info/
+.venv/
+.*.log

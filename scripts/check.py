@@ -41,11 +41,11 @@ def main():
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
-    command = [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"]
+    command = [sys.executable, "-W", "always::ResourceWarning", "-m", "unittest", "discover", "-s", "tests", "-v"]
     result = subprocess.run(command, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    if result.returncode:
+    if result.returncode or "ResourceWarning:" in result.stdout:
         print(result.stdout[-12000:])
-        return result.returncode
+        return result.returncode or 1
     summary = re.search(r"Ran \d+ tests.*", result.stdout, flags=re.S)
     print(summary.group(0).strip() if summary else "Fixture suite passed")
     if not shutil.which("git"):

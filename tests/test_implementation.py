@@ -11,9 +11,9 @@ import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import implementation_index as impl
-import workspace_index as w
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from repoindex import implementations as impl
+from repoindex import workspace as w
 
 class ImplementationTests(unittest.TestCase):
     def setUp(self):
