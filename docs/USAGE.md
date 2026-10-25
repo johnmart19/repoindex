@@ -40,7 +40,9 @@ python3 /path/to/repoindex workspace source platform/src/parser.cpp --line 120 -
 
 All trees are selected by default. `--tree NAME` is repeatable. Choose either a
 named `--scope` or repeatable `--path-prefix tree/component`; they intersect with
-selected trees. An empty intersection returns no matches. Results follow configured
+selected trees. An empty intersection returns no matches. Explicit empty Python tree/prefix lists
+also mean no selection; only `None` selects defaults. Paths normalize repeated
+slashes and `.` segments; `..` is rejected. Results follow configured
 tree order, then path order; implementation hits follow starting line order.
 `search` remains an alias for `files`.
 
@@ -75,6 +77,9 @@ stderr; narrow selection before raising `--limit` or `--max-output-bytes`. If th
 first JSON record cannot fit, exit 3 emits no partial record: request fewer source
 lines or a larger explicit budget. Human text may end at a UTF-8-safe budget
 boundary. Symbol declarations are width-bounded in either format.
+
+A `source` request past EOF returns no rows. `--scope`/`--path-prefix` are query
+options; maintenance rejects them instead of silently refreshing whole trees.
 
 The output budget stops read-only producers promptly. Explicit maintenance still
 finishes every selected tree even if its summaries exceed the display budget.

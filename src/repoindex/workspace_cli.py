@@ -3,15 +3,16 @@ import argparse
 import contextlib
 import io
 import json
+import math
 from pathlib import Path
 import sqlite3
 import statistics
 import subprocess
 import sys
-import tempfile
 import time
 
 from . import workspace
+from .bundles import atomic_text
 from .configuration import find_workspace, scopes, selected_paths
 
 QUERY_MODES = {"files", "symbol", "impl", "source", "text"}
@@ -102,14 +103,7 @@ def write_guide(root, output=None, replace=False):
     existing = target.read_text(encoding="utf-8") if target.exists() else ""
     text = merge_guide(existing, "\n".join(lines), replace=replace)
     target.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent, delete=False) as out:
-        temporary = Path(out.name)
-        out.write(text)
-    try:
-        temporary.replace(target)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    atomic_text(target, text)
     return {"guide": target.relative_to(root).as_posix()}
 
 
@@ -117,21 +111,29 @@ def benchmark(root, names, data, samples=5, output=None, compare=None, budget=No
     if samples < 3:
         raise ValueError("Use at least three benchmark samples")
     cases = data.get("benchmarks", [])
-    if not cases:
-        raise ValueError("No benchmarks configured in repoindex.json")
+    if not isinstance(cases, list) or not cases:
+        raise ValueError("No benchmark list configured in repoindex.json")
+    if budget is not None and (not math.isfinite(budget) or budget < 0):
+        raise ValueError("Benchmark budget must be finite and nonnegative")
+    prepared = []
+    for case in cases:
+        if not isinstance(case, dict) or case.get("mode") not in {"files", "symbol", "impl"}:
+            raise ValueError("Benchmark cases require files/symbol/impl mode")
+        if not isinstance(case.get("query"), str) or not case["query"]:
+            raise ValueError("Benchmark cases require a nonempty query")
+        if type(case.get("limit", 20)) is not int or case.get("limit", 20) < 1:
+            raise ValueError("Benchmark limit must be a positive integer")
+        prepared.append((case, selected_paths(root, data, names, case.get("scope"), case.get("prefixes"))))
     previous = {}
     if compare:
         for row in json.loads(Path(compare).read_text(encoding="utf-8")):
-            previous[json.dumps([row["mode"], row.get("query", row.get("pattern")), selected_paths(root, data, names, None, row.get("prefixes"))])] = row
+            previous[json.dumps([row["mode"], row.get("query", row.get("pattern")), selected_paths(root, data, data["trees"], None, row.get("prefixes"))])] = row
     for tree in names:
         workspace.ensure_db(root, tree)
     results = []
     exceeded = False
-    for case in cases:
+    for case, prefixes in prepared:
         mode, query = case["mode"], case["query"]
-        if mode not in {"files", "symbol", "impl"}:
-            raise ValueError("Benchmark mode must be files, symbol or impl")
-        prefixes = selected_paths(root, data, names, case.get("scope"), case.get("prefixes"))
         timings = []
         for _ in range(samples):
             with contextlib.redirect_stderr(io.StringIO()):
@@ -250,8 +252,8 @@ def main(argv=None):
             raise ValueError("Require positive jobs, chunk size 1..32 MiB and context 0..5")
         if args.regex and action != "text":
             raise ValueError("--regex is for live text only; impl uses exact literals")
-        if args.scope and action not in QUERY_MODES:
-            raise ValueError("--scope applies to query commands, not whole-tree maintenance")
+        if (args.scope or args.path_prefix is not None) and action not in QUERY_MODES:
+            raise ValueError("--scope/--path-prefix apply to query commands, not whole-tree maintenance")
         if action in QUERY_MODES and not args.query:
             raise ValueError("Query or source path required")
         if action not in QUERY_MODES and args.query is not None:

@@ -2,7 +2,6 @@
 """Build an sdist/wheel and test isolated installed use. No network or real sources."""
 from pathlib import Path
 import json
-import os
 import subprocess
 import sys
 import tarfile

@@ -159,14 +159,20 @@ def search(db, pattern, prefixes, context=0, max_chars=400):
             following = body.find("\n", offset)
             offset = -1 if following < 0 else body.find(pattern, following + 1)
 
-def read(db, path, line=1, limit=40, max_chars=400):
-    available(db)
+def validate_range(line, limit, max_chars):
     if line < 1 or not 1 <= limit <= 200 or not 16 <= max_chars <= 2000:
         raise ValueError("Require line >=1, 1..200 lines and line width 16..2000")
+
+
+def read(db, path, line=1, limit=40, max_chars=400):
+    validate_range(line, limit, max_chars)
+    available(db)
     row = db.execute("SELECT body,source_sha256,lines FROM implementation_files WHERE path=?", (path,)).fetchone()
     if row is None:
         return None
     body, sha, total = row
+    if line > total:
+        return None
     lines = body.split("\n")
     chosen = lines[line-1:min(total, line-1+limit)]
     clipped = any(len(text) > max_chars for text in chosen)

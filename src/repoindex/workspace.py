@@ -5,7 +5,7 @@ import sqlite3
 import sys
 import tempfile
 import time
-from .configuration import config, selected, contained
+from .configuration import config, selected, contained, selected_paths, normalized_path
 from .bundles import FORMAT, MAX_PART, MAX_RAW_PART, MAX_DB, digest, lock, atomic_json, pack, manifest, cached_db, ensure_db
 from .database import open_db_required, prepare_search, files_sql
 from .scanner import build_index
@@ -34,10 +34,12 @@ def query(root, names, mode, pattern, limit=40, prefixes=None, context=0, max_ch
     """Global limit across selected trees; paths always relative to the workspace."""
     if limit < 1 or mode not in ("files", "symbol", "impl"):
         raise ValueError("Positive limit and files/symbol/impl mode required")
+    names = selected(root, names)
+    prefixes = selected_paths(root, config(root), names, prefixes=prefixes)
     count = 0
-    for tree in selected(root, names):
+    for tree in names:
         local = []
-        for prefix in prefixes or [tree]:
+        for prefix in prefixes:
             prefix = prefix.replace("\\", "/").strip("/")
             if prefix == tree:
                 local.append("")
@@ -115,10 +117,13 @@ def optimize(root, tree, implementations=False):
 
 def read_source(root, names, path, line=1, limit=40, max_chars=400, prefixes=None):
     from . import implementations as implementation_index
-    path = path.replace("\\", "/")
-    if prefixes and not any(path == prefix.rstrip("/") or path.startswith(prefix.rstrip("/") + "/") for prefix in prefixes):
+    implementation_index.validate_range(line, limit, max_chars)
+    path = normalized_path(root, path)
+    names = selected(root, names)
+    prefixes = selected_paths(root, config(root), names, prefixes=prefixes)
+    if not any(path == prefix.rstrip("/") or path.startswith(prefix.rstrip("/") + "/") for prefix in prefixes):
         return
-    for tree in selected(root, names):
+    for tree in names:
         if not path.startswith(tree + "/"):
             continue
         relative = path[len(tree) + 1:]

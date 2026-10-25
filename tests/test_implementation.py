@@ -31,6 +31,22 @@ class ImplementationTests(unittest.TestCase):
             (folder / "helper.cc").write_text("int helper() { return helper_body(42); }\n")
             w.build(self.root, tree, jobs=1, chunk_bytes=1024)
 
+    def test_empty_api_selection_never_broadens_queries(self):
+        for mode, query in [("files", "Mode"), ("symbol", "Mode"), ("impl", "Needle_TOKEN")]:
+            self.assertEqual([], list(w.query(self.root, [], mode, query)))
+            self.assertEqual([], list(w.query(self.root, None, mode, query, prefixes=[])))
+        self.assertEqual([], list(w.read_source(self.root, [], "alpha/src/engine.cpp")))
+        self.assertEqual([], list(w.read_source(self.root, None, "alpha/src/engine.cpp", prefixes=[])))
+
+    def test_source_past_end_returns_no_range(self):
+        self.assertEqual([], list(w.read_source(self.root, None, "alpha/src/engine.cpp", line=10000)))
+
+    def test_prefix_normalization_is_consistent_between_query_and_source(self):
+        rows = list(w.query(self.root, None, "impl", "Needle_TOKEN", prefixes=["alpha/./src/"]))
+        self.assertEqual(["alpha"], [row["tree"] for row in rows])
+        blocks = list(w.read_source(self.root, None, "alpha/./src/engine.cpp", prefixes=["alpha/src/"]))
+        self.assertEqual(1, len(blocks))
+
     def test_all_files_bodies_and_raw_hashes(self):
         meta = w.manifest(self.root, "alpha")["metadata"]
         self.assertEqual("2", meta["implementation_count"])

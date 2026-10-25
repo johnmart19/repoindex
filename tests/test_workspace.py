@@ -30,6 +30,18 @@ class WorkspaceTests(unittest.TestCase):
         shutil.copytree(self.root, moved, ignore=shutil.ignore_patterns(".cache"))
         return moved
 
+    def test_decompression_failure_is_clean_and_does_not_publish_cache(self):
+        moved = self.root / "without-cache"
+        moved.mkdir()
+        shutil.copy2(self.root / "repoindex.json", moved / "repoindex.json")
+        shutil.copytree(self.root / "index", moved / "index")
+        from repoindex import bundles
+        with mock.patch.object(bundles.gzip, "open", side_effect=EOFError("truncated")):
+            with self.assertRaisesRegex(ValueError, "Cannot decompress chunk"):
+                w.ensure_db(moved, "alpha")
+        self.assertEqual([], list((moved / ".cache/repoindex/alpha").glob("*.db")))
+        self.assertEqual([], list((moved / ".cache/repoindex/alpha").glob("restore-*")))
+
     def test_default_both_and_optional_one(self):
         rows = list(w.query(self.root, None, "symbol", "SharedMode"))
         self.assertEqual(["alpha/src/Mode.h", "beta/src/Mode.h"], [x["path"] for x in rows])

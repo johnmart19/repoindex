@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import zlib
 from .configuration import contained
 from .database import open_db_required, prepare_search
 
@@ -36,17 +37,22 @@ def lock(root, name):
         yield cache
 
 
-def atomic_json(path, data):
+def atomic_text(path, text):
+    """Replace a UTF-8 document atomically and clean staging on every failure."""
     path = Path(path)
-    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as stream:
-        temp = Path(stream.name)
-        json.dump(data, stream, indent=2, sort_keys=True)
-        stream.write("\n")
+    temporary = None
     try:
-        os.replace(temp, path)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(text)
+        os.replace(temporary, path)
     finally:
-        if temp.exists():
-            temp.unlink()
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
+
+def atomic_json(path, data):
+    atomic_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
 def pack(db, directory, tree, chunk_bytes=MAX_RAW_PART):
@@ -107,17 +113,22 @@ def manifest(root, tree):
     if path.stat().st_size > 1024 ** 2:
         raise ValueError("Manifest too large")
     data = json.loads(path.read_text())
-    if data.get("format") != FORMAT or data.get("tree") != tree:
+    if not isinstance(data, dict) or data.get("format") != FORMAT or data.get("tree") != tree:
         raise ValueError("Incompatible bundle identity/format")
     if not re.fullmatch(r"[a-f0-9]{64}", data.get("database_sha256", "")):
         raise ValueError("Invalid database checksum")
     if not isinstance(data.get("database_bytes"), int) or not 0 < data["database_bytes"] <= MAX_DB:
         raise ValueError("Invalid database size")
+    metadata = data.get("metadata")
+    if not isinstance(metadata, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in metadata.items()):
+        raise ValueError("Invalid manifest metadata")
     parts = data.get("parts")
     if not isinstance(parts, list) or not 0 < len(parts) <= 16384:
         raise ValueError("Invalid chunk list")
     total = 0
     for part in parts:
+        if not isinstance(part, dict):
+            raise ValueError("Invalid chunk entry")
         sha = part.get("sha256", "")
         if not re.fullmatch(r"[a-f0-9]{64}", sha) or part.get("file") != "part-" + sha + ".gz":
             raise ValueError("Invalid chunk name/checksum")
@@ -170,9 +181,12 @@ def ensure_db(root, tree):
                     path = contained(directory, part["file"])
                     if path.stat().st_size != part["bytes"] or digest(path) != part["sha256"]:
                         raise ValueError("Chunk integrity failure: " + part["file"])
-                    with gzip.open(path, "rb") as source:
-                        # Bounded decompression, including a byte to detect oversized input.
-                        raw = source.read(part["raw_bytes"] + 1)
+                    try:
+                        with gzip.open(path, "rb") as source:
+                            # Bounded decompression, including a byte to detect oversized input.
+                            raw = source.read(part["raw_bytes"] + 1)
+                    except (OSError, EOFError, zlib.error) as error:
+                        raise ValueError("Cannot decompress chunk: " + part["file"]) from error
                     if len(raw) != part["raw_bytes"]:
                         raise ValueError("Decompressed chunk size mismatch")
                     output.write(raw)

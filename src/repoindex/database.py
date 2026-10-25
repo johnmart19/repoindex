@@ -120,7 +120,7 @@ def open_db_required(db_path):
             print("Warning: snapshot has %s scan errors; results are incomplete."
                   % errors[0], file=sys.stderr)
         return db
-    except (sqlite3.Error, ValueError) as error:
+    except (sqlite3.Error, ValueError, TypeError) as error:
         if db is not None:
             db.close()
         raise IndexReadError("Cannot read index %s: %s. Run 'repoindex index ROOT' "

@@ -42,6 +42,20 @@ class FrontendTests(unittest.TestCase):
         self.assertEqual(0, code, errors.getvalue())
         return output.getvalue().splitlines()
 
+    def test_maintenance_rejects_prefix_instead_of_indexing_whole_tree(self):
+        with mock.patch.object(workspace, "build") as build, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(2, cli.main(["index", "--path-prefix", "alpha/drivers", "--workspace", str(self.root)]))
+        build.assert_not_called()
+
+    def test_comparison_does_not_mix_different_tree_selections(self):
+        config = workspace.config(self.root)
+        config["benchmarks"] = [{"mode": "impl", "query": "run_body"}]
+        baseline = self.root / "baseline.json"
+        before, _ = cli.benchmark(self.root, self.names, config, samples=3, output=baseline)
+        after, _ = cli.benchmark(self.root, ["alpha"], config, samples=3, compare=baseline)
+        self.assertNotEqual(before[0]["rows"], after[0]["rows"])
+        self.assertNotIn("before_ms", after[0])
+
     def test_file_and_symbol_scope_exclude_sibling(self):
         for mode in ("files", "symbol"):
             rows = [json.loads(x) for x in self.query([mode, "UniqueMode" if mode == "symbol" else "Mode", "--scope", "core"])]
